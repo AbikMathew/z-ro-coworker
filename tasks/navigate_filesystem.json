@@ -1,0 +1,66 @@
+{
+  "id": "navigate_filesystem",
+  "title": "Navigate Your File System",
+  "description": "Learn to navigate files and folders like a pro using your file explorer.",
+  "xp_reward": 20,
+  "steps": [
+    {
+      "id": "open_finder",
+      "instruction": "Open your file explorer (Finder on Mac, File Explorer on Windows)",
+      "hints": ["Look for the Finder icon in your dock (the smiling face)", "You can also press Cmd+Space and type 'Finder'"],
+      "validation": {
+        "type": "app_context",
+        "match": {
+          "window_title_contains": null,
+          "process_name": "Finder"
+        },
+        "fallback_ai": false
+      },
+      "overlay": {
+        "type": "tooltip",
+        "text": "Open Finder from your dock",
+        "position": "center"
+      },
+      "xp": 5
+    },
+    {
+      "id": "go_to_documents",
+      "instruction": "Navigate to your Documents folder",
+      "hints": ["In Finder, look at the sidebar on the left for 'Documents'", "You can also press Cmd+Shift+O"],
+      "validation": {
+        "type": "app_context",
+        "match": {
+          "window_title_contains": "Documents",
+          "process_name": null
+        },
+        "fallback_ai": false
+      },
+      "overlay": {
+        "type": "tooltip",
+        "text": "Click 'Documents' in the sidebar",
+        "position": "left"
+      },
+      "xp": 5
+    },
+    {
+      "id": "create_folder",
+      "instruction": "Create a new folder called 'Z-RO Practice'",
+      "hints": ["Right-click in the empty space and select 'New Folder'", "Or press Cmd+Shift+N"],
+      "validation": null,
+      "overlay": {
+        "type": "tooltip",
+        "text": "Right-click > New Folder, then name it 'Z-RO Practice'",
+        "position": "center"
+      },
+      "xp": 10
+    },
+    {
+      "id": "verify_folder",
+      "instruction": "Confirm you can see the 'Z-RO Practice' folder in Documents",
+      "hints": ["You should see the new folder in the file list"],
+      "validation": null,
+      "overlay": null,
+      "xp": 5
+    }
+  ]
+}
