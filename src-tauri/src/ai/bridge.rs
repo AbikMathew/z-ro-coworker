@@ -1,23 +1,11 @@
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde_json::json;
 
 #[derive(Clone)]
 pub struct AiBridge {
     client: Client,
     api_key: String,
-}
-
-#[derive(Serialize)]
-struct ChatRequest {
-    model: String,
-    messages: Vec<ChatMessage>,
-    max_tokens: u32,
-}
-
-#[derive(Serialize, Deserialize)]
-struct ChatMessage {
-    role: String,
-    content: String,
 }
 
 #[derive(Deserialize)]
@@ -27,7 +15,12 @@ struct ChatResponse {
 
 #[derive(Deserialize)]
 struct Choice {
-    message: ChatMessage,
+    message: ResponseMessage,
+}
+
+#[derive(Deserialize)]
+struct ResponseMessage {
+    content: String,
 }
 
 impl AiBridge {
@@ -45,21 +38,61 @@ impl AiBridge {
 
         let system_prompt = super::prompts::get_coworker_prompt(task_context);
 
-        let request = ChatRequest {
-            model: "gpt-4o-mini".to_string(),
-            messages: vec![
-                ChatMessage {
-                    role: "system".to_string(),
-                    content: system_prompt,
-                },
-                ChatMessage {
-                    role: "user".to_string(),
-                    content: question.to_string(),
-                },
+        let request = json!({
+            "model": "gpt-4o-mini",
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": question }
             ],
-            max_tokens: 300,
-        };
+            "max_tokens": 300
+        });
 
+        self.call_api(request).await
+    }
+
+    pub async fn analyze_screenshot(
+        &self,
+        base64_image: &str,
+        question: &str,
+        task_context: &str,
+    ) -> Result<String, String> {
+        if self.api_key.is_empty() {
+            return Ok("AI is not configured. Add your OpenAI API key to .env".to_string());
+        }
+
+        let system_prompt = super::prompts::get_vision_prompt(task_context);
+
+        let request = json!({
+            "model": "gpt-4o",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": system_prompt
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": question
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:image/png;base64,{}", base64_image),
+                                "detail": "low"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 500
+        });
+
+        self.call_api(request).await
+    }
+
+    async fn call_api(&self, request: serde_json::Value) -> Result<String, String> {
         let response = self.client
             .post("https://api.openai.com/v1/chat/completions")
             .header("Authorization", format!("Bearer {}", self.api_key))
@@ -67,6 +100,12 @@ impl AiBridge {
             .send()
             .await
             .map_err(|e| format!("API request failed: {}", e))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let error_body = response.text().await.unwrap_or_default();
+            return Err(format!("API error ({}): {}", status, error_body));
+        }
 
         let chat_response: ChatResponse = response
             .json()

@@ -1,7 +1,13 @@
-use crate::task_engine::types::TaskState;
+use crate::task_engine::types::{Task, TaskState};
 use tauri::State;
 use std::sync::Mutex;
 use crate::task_engine::machine::TaskMachine;
+
+#[tauri::command]
+pub fn list_tasks(machine: State<Mutex<TaskMachine>>) -> Result<Vec<Task>, String> {
+    let machine = machine.lock().map_err(|e| e.to_string())?;
+    Ok(machine.list_tasks())
+}
 
 #[tauri::command]
 pub fn start_task(task_id: String, machine: State<Mutex<TaskMachine>>) -> Result<TaskState, String> {
