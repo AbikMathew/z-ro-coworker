@@ -60,6 +60,9 @@ pub fn run() {
             commands::overlay::hide_overlay,
             commands::overlay::update_overlay,
             commands::ai::request_help,
+            commands::ai::analyze_screenshot,
+            commands::screenshot::capture_screenshot,
+            commands::screenshot::capture_screenshot_region,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

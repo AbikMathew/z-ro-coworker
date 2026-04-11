@@ -7,8 +7,8 @@
   import type { TaskState } from "$lib/types/task";
   import type { WindowInfo } from "$lib/types/context";
 
-  let state: TaskState | null = $state(null);
-  taskState.subscribe((v) => (state = v));
+  let currentTask: TaskState | null = $state(null);
+  taskState.subscribe((v) => (currentTask = v));
 
   // Debug state
   let windowInfo: WindowInfo | null = $state(null);
@@ -18,7 +18,10 @@
   let debugLog: string[] = $state([]);
 
   function log(msg: string) {
-    debugLog = [...debugLog.slice(-19), `${new Date().toLocaleTimeString()} ${msg}`];
+    debugLog = [
+      ...debugLog.slice(-19),
+      `${new Date().toLocaleTimeString()} ${msg}`,
+    ];
   }
 
   async function loadTasks() {
@@ -110,6 +113,40 @@
     }
   }
 
+  // Screenshot + Vision
+  let screenshotLoading = $state(false);
+  let visionResponse = $state("");
+  let screenshotPreview = $state("");
+
+  async function captureAndAnalyze() {
+    screenshotLoading = true;
+    visionResponse = "";
+    screenshotPreview = "";
+    try {
+      log("Capturing screenshot...");
+      const base64 = await invoke<string>("capture_screenshot");
+      screenshotPreview = base64.slice(0, 100) + "...";
+      log(`Screenshot captured (${base64.length} chars)`);
+
+      log("Sending to Vision AI...");
+      const response = await invoke<string>("analyze_screenshot", {
+        base64Image: base64,
+        question:
+          "What is currently on the user's screen? Describe the active application and what they appear to be doing.",
+        taskContext: currentTask
+          ? `Task: ${currentTask.task_id}, Step ${currentTask.current_step_index + 1}`
+          : "No active task",
+      });
+      visionResponse = response;
+      log("Vision AI responded");
+    } catch (e) {
+      visionResponse = `Error: ${e}`;
+      log(`Screenshot/Vision error: ${e}`);
+    } finally {
+      screenshotLoading = false;
+    }
+  }
+
   // Load tasks on mount
   loadTasks();
 </script>
@@ -122,19 +159,21 @@
         <h1 class="text-3xl font-bold tracking-tight">Z-RO Cowork</h1>
         <p class="text-gray-400 text-sm mt-1">AI-powered co-worker assistant</p>
       </div>
-      {#if state}
-        <ProgressBar xp={state.xp_earned} />
+      {#if currentTask}
+        <ProgressBar xp={currentTask.xp_earned} />
       {/if}
     </div>
 
-    {#if !state}
+    {#if !currentTask}
       <!-- Dashboard: Task selection + Feature testing -->
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <!-- Available Tasks -->
         <div class="space-y-4">
           <h2 class="text-lg font-semibold">Available Tasks</h2>
           {#if availableTasks.length === 0}
-            <div class="bg-gray-900 rounded-xl p-4 border border-gray-800 text-gray-500 text-sm">
+            <div
+              class="bg-gray-900 rounded-xl p-4 border border-gray-800 text-gray-500 text-sm"
+            >
               No tasks loaded. Check the tasks/ directory.
             </div>
           {/if}
@@ -143,7 +182,9 @@
               <h3 class="font-medium">{task.title}</h3>
               <p class="text-gray-400 text-sm mt-1">{task.description}</p>
               <div class="flex items-center justify-between mt-3">
-                <span class="text-yellow-500 text-sm">+{task.xp_reward} XP bonus</span>
+                <span class="text-yellow-500 text-sm"
+                  >+{task.xp_reward} XP bonus</span
+                >
                 <button
                   onclick={() => handleStartTask(task.id)}
                   class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm transition-colors"
@@ -170,19 +211,34 @@
             </div>
             {#if windowInfo}
               <div class="space-y-1 text-sm font-mono">
-                <p><span class="text-gray-500">Process:</span> <span class="text-green-400">{windowInfo.process_name}</span></p>
-                <p><span class="text-gray-500">Window:</span> <span class="text-blue-400">{windowInfo.title}</span></p>
-                <p><span class="text-gray-500">Bundle:</span> <span class="text-yellow-400">{windowInfo.bundle_id || "N/A"}</span></p>
+                <p>
+                  <span class="text-gray-500">Process:</span>
+                  <span class="text-green-400">{windowInfo.process_name}</span>
+                </p>
+                <p>
+                  <span class="text-gray-500">Window:</span>
+                  <span class="text-blue-400">{windowInfo.title}</span>
+                </p>
+                <p>
+                  <span class="text-gray-500">Bundle:</span>
+                  <span class="text-yellow-400"
+                    >{windowInfo.bundle_id || "N/A"}</span
+                  >
+                </p>
               </div>
             {:else}
-              <p class="text-gray-500 text-sm">Click "Start Polling" to detect active windows</p>
+              <p class="text-gray-500 text-sm">
+                Click "Start Polling" to detect active windows
+              </p>
             {/if}
           </div>
 
           <!-- Overlay Testing -->
           <h2 class="text-lg font-semibold mt-6">Overlay System</h2>
           <div class="bg-gray-900 rounded-xl p-4 border border-gray-800">
-            <p class="text-gray-400 text-sm mb-3">Test the visual overlay (highlights, tooltips, arrows)</p>
+            <p class="text-gray-400 text-sm mb-3">
+              Test the visual overlay (highlights, tooltips, arrows)
+            </p>
             <div class="flex gap-2">
               <button
                 onclick={testOverlay}
@@ -198,6 +254,29 @@
               </button>
             </div>
           </div>
+
+          <!-- Screenshot + Vision AI -->
+          <h2 class="text-lg font-semibold mt-6">Screenshot + Vision AI</h2>
+          <div class="bg-gray-900 rounded-xl p-4 border border-gray-800">
+            <p class="text-gray-400 text-sm mb-3">
+              Capture screen and analyze with GPT-4o Vision
+            </p>
+            <button
+              onclick={captureAndAnalyze}
+              disabled={screenshotLoading}
+              class="bg-amber-600 hover:bg-amber-700 disabled:bg-gray-700 disabled:text-gray-500 text-white px-4 py-2 rounded-lg text-sm transition-colors"
+            >
+              {screenshotLoading ? "Analyzing..." : "Capture & Analyze Screen"}
+            </button>
+            {#if visionResponse}
+              <div class="mt-3 p-3 bg-gray-800 rounded-lg text-sm">
+                <p class="text-gray-400 text-xs mb-1">Zee's observation:</p>
+                <p class="text-gray-200 whitespace-pre-wrap">
+                  {visionResponse}
+                </p>
+              </div>
+            {/if}
+          </div>
         </div>
 
         <!-- NPC Chat + Debug Log -->
@@ -207,7 +286,9 @@
 
           <!-- Debug Log -->
           <h2 class="text-lg font-semibold mt-4">Debug Log</h2>
-          <div class="bg-gray-900 rounded-xl p-4 border border-gray-800 h-48 overflow-y-auto font-mono text-xs">
+          <div
+            class="bg-gray-900 rounded-xl p-4 border border-gray-800 h-48 overflow-y-auto font-mono text-xs"
+          >
             {#each debugLog as entry}
               <p class="text-gray-400">{entry}</p>
             {/each}
@@ -222,7 +303,7 @@
       <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div class="space-y-4">
           <TaskPanel />
-          <ProgressBar xp={state.xp_earned} />
+          <ProgressBar xp={currentTask.xp_earned} />
         </div>
         <div>
           <NPCChat />
