@@ -4,6 +4,7 @@ mod context;
 mod ai;
 mod overlay;
 mod storage;
+mod capture;
 
 use std::sync::Mutex;
 use task_engine::machine::TaskMachine;
@@ -63,6 +64,7 @@ pub fn run() {
             commands::ai::analyze_screenshot,
             commands::screenshot::capture_screenshot,
             commands::screenshot::capture_screenshot_region,
+            commands::env::get_gemini_api_key,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

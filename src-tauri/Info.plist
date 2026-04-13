@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>NSCameraUsageDescription</key>
+  <string>Z-RO Cowork uses your camera when you turn on the Webcam mode in the Coworker screen so Zee can see what you're working on.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Z-RO Cowork uses your microphone when you turn on the Talk mode in the Coworker screen so Zee can hear you and respond.</string>
+  <key>NSScreenCaptureDescription</key>
+  <string>Z-RO Cowork captures your screen when you turn on the Share Screen mode in the Coworker screen so Zee can see what's on your display.</string>
+</dict>
+</plist>

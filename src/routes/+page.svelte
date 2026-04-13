@@ -159,9 +159,17 @@
         <h1 class="text-3xl font-bold tracking-tight">Z-RO Cowork</h1>
         <p class="text-gray-400 text-sm mt-1">AI-powered co-worker assistant</p>
       </div>
-      {#if currentTask}
-        <ProgressBar xp={currentTask.xp_earned} />
-      {/if}
+      <div class="flex items-center gap-4">
+        <a
+          href="/coworker"
+          class="px-4 py-2 rounded-full text-sm bg-gray-900 hover:bg-gray-800 text-gray-200 border border-gray-800 transition-colors"
+        >
+          Open Coworker →
+        </a>
+        {#if currentTask}
+          <ProgressBar xp={currentTask.xp_earned} />
+        {/if}
+      </div>
     </div>
 
     {#if !currentTask}
