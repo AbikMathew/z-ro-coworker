@@ -331,6 +331,7 @@ export class GeminiClient {
       const next = this.openSocket();
       await this.attachAndSetup(next, handle);
       this.ws = next;
+      this.reconnectAttempt = 0; // successful swap — reset backoff counter
       this.emitStatus("connected");
       try {
         oldSocket.close();

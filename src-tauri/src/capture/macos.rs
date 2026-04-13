@@ -7,5 +7,5 @@
 /// implementation goes here.
 #[allow(dead_code)]
 pub fn capture_primary_display() -> Result<Vec<u8>, String> {
-    todo!("macOS native ScreenCaptureKit capture not yet implemented")
+    Err("macOS native ScreenCaptureKit capture not yet implemented".to_string())
 }
