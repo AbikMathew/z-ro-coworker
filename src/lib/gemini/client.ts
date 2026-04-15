@@ -77,6 +77,19 @@ const DEFAULT_SYSTEM_INSTRUCTION =
 const RECONNECT_BACKOFFS_MS = [500, 1_000, 2_000, 4_000, 8_000];
 const GOAWAY_THRESHOLD_MS = 10_000;
 
+/**
+ * WebSocket close codes that indicate the SESSION itself is broken — meaning
+ * the saved resumption handle is almost certainly the problem. On these codes
+ * we clear the handle and retry with a fresh session instead of hammering the
+ * server with more handle-based setup attempts (which cause 400/409 storms).
+ *
+ *   1002 protocol error
+ *   1007 invalid frame payload
+ *   1008 policy violation (Google uses this for auth / session conflicts)
+ *   1011 internal server error (often: handle invalid on server side)
+ */
+const SESSION_BROKEN_CLOSE_CODES = new Set([1002, 1007, 1008, 1011]);
+
 export interface WireLogEntry {
   direction: "send" | "recv";
   ts: number;
@@ -111,6 +124,10 @@ export class GeminiClient {
   private reconnectAttempt = 0;
   private closedByUser = false;
   private isSwapping = false;
+  /** Whether the most recent connect() tried to resume a saved handle. */
+  private lastConnectUsedHandle = false;
+  /** True once we've seen setupComplete on the current socket. */
+  private setupAcked = false;
 
   constructor(opts: GeminiClientOptions) {
     this.opts = {
@@ -131,6 +148,8 @@ export class GeminiClient {
     this.closedByUser = false;
     this.emitStatus("connecting");
     const handle = loadHandle() ?? undefined;
+    this.lastConnectUsedHandle = handle !== undefined;
+    this.setupAcked = false;
     const ws = this.openSocket();
     try {
       await this.attachAndSetup(ws, handle);
@@ -275,6 +294,7 @@ export class GeminiClient {
     this.opts.onWireLog?.({ direction: "recv", ts: Date.now(), payload: redactForLog(msg) });
 
     if (msg.setupComplete) {
+      this.setupAcked = true;
       this.setupAckResolve?.();
       this.setupAckResolve = null;
       this.setupAckReject = null;
@@ -339,7 +359,14 @@ export class GeminiClient {
         // ignore
       }
     } catch (e) {
-      this.emitStatus("error", `swap failed: ${String(e)}`);
+      // goAway handoff failed — the handle was rejected on the new socket.
+      // Drop it so the old socket's impending onclose → handleUnexpectedClose
+      // path tries a fresh session instead of looping on the bad handle.
+      clearHandle();
+      this.emitStatus(
+        "reconnecting",
+        `goAway swap failed (${String(e)}) — handle cleared, will retry fresh`,
+      );
     } finally {
       this.isSwapping = false;
     }
@@ -347,17 +374,50 @@ export class GeminiClient {
 
   private handleUnexpectedClose(event: CloseEvent): void {
     const detail = closeDetail(event);
+
+    // Fast-path: the saved handle is poisoned. We drop it NOW (before burning
+    // more retry attempts that will all fail the same way) if either:
+    //   (a) The close code says "session broken" (1002/1007/1008/1011), OR
+    //   (b) We tried a handle, never got setupComplete, and it closed.
+    // Case (b) is the classic "ghost session" — a previous disconnect left
+    // the handle in limbo on Google's side, now it's rejected on reopen.
+    const handleLikelyPoisoned =
+      (this.lastConnectUsedHandle && !this.setupAcked) ||
+      SESSION_BROKEN_CLOSE_CODES.has(event.code);
+
+    if (handleLikelyPoisoned && loadHandle()) {
+      clearHandle();
+      this.emitStatus(
+        "reconnecting",
+        `session handle looked poisoned (${detail}) — starting fresh`,
+      );
+      this.reconnectAttempt = 0;
+      setTimeout(() => {
+        if (this.closedByUser) return;
+        void this.connect();
+      }, 250);
+      return;
+    }
+
     const attempt = this.reconnectAttempt + 1;
     const backoff =
       RECONNECT_BACKOFFS_MS[Math.min(this.reconnectAttempt, RECONNECT_BACKOFFS_MS.length - 1)];
     this.reconnectAttempt += 1;
 
     if (this.reconnectAttempt > RECONNECT_BACKOFFS_MS.length) {
-      // Saved handle may be poisoned — clear it so the user's next manual
-      // reconnect (page refresh) starts a fresh session rather than resuming
-      // a broken one.
+      // Out of retries. Clear the handle and kick one final fresh attempt
+      // before surfacing an error — gives the user a chance to recover
+      // without a manual page refresh.
       clearHandle();
-      this.emitStatus("error", `max reconnect attempts reached — last close: ${detail}`);
+      this.reconnectAttempt = 0;
+      this.emitStatus(
+        "reconnecting",
+        `max attempts with handle reached (${detail}) — last try with fresh session`,
+      );
+      setTimeout(() => {
+        if (this.closedByUser) return;
+        void this.connect();
+      }, 1_000);
       return;
     }
 
