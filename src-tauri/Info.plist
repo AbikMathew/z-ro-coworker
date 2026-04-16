@@ -8,5 +8,7 @@
   <string>Z-RO Cowork uses your microphone when you turn on the Talk mode in the Coworker screen so Zee can hear you and respond.</string>
   <key>NSScreenCaptureDescription</key>
   <string>Z-RO Cowork captures your screen when you turn on the Share Screen mode in the Coworker screen so Zee can see what's on your display.</string>
+  <key>NSAccessibilityUsageDescription</key>
+  <string>Z-RO Cowork reads UI context from apps so Zee can understand what you're working on and guide you.</string>
 </dict>
 </plist>

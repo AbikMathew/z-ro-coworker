@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import TaskPanel from "$lib/components/TaskPanel.svelte";
-  import NPCChat from "$lib/components/NPCChat.svelte";
+  import NpcPanel from "$lib/components/NpcPanel.svelte";
   import ProgressBar from "$lib/components/ProgressBar.svelte";
   import { taskState, startTask } from "$lib/stores/taskStore";
   import type { TaskState } from "$lib/types/task";
@@ -290,7 +290,7 @@
         <!-- NPC Chat + Debug Log -->
         <div class="space-y-4">
           <h2 class="text-lg font-semibold">Ask Zee (AI Co-worker)</h2>
-          <NPCChat />
+          <NpcPanel />
 
           <!-- Debug Log -->
           <h2 class="text-lg font-semibold mt-4">Debug Log</h2>
@@ -314,7 +314,7 @@
           <ProgressBar xp={currentTask.xp_earned} />
         </div>
         <div>
-          <NPCChat />
+          <NpcPanel />
         </div>
       </div>
     {/if}

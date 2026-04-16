@@ -6,5 +6,6 @@ pub fn get_active_window() -> Result<WindowInfo, String> {
         title: "Not implemented".to_string(),
         process_name: "Unknown".to_string(),
         bundle_id: None,
+        pid: None,
     })
 }
