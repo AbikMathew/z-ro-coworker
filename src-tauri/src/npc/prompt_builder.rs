@@ -7,10 +7,18 @@ use super::conversation::ConversationTurn;
 use super::screen_reader::ScreenContext;
 
 /// A single message in the LLM conversation (OpenAI-style format).
+///
+/// `images_b64` is only used on the current user turn when the screen reader
+/// falls back to a screenshot (thin AX tree apps like Electron / canvas).
+/// History turns always leave it empty.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmMessage {
     pub role: String,
     pub content: String,
+    /// Base64-encoded JPEG images to attach. When non-empty, providers that
+    /// support vision use the multimodal content array format.
+    #[serde(default)]
+    pub images_b64: Vec<String>,
 }
 
 /// Assembles the full prompt (system + messages) for each NPC turn.
@@ -42,11 +50,12 @@ impl PromptBuilder {
 
         let mut messages: Vec<LlmMessage> = Vec::with_capacity(history.len() + 1);
 
-        // Append conversation history
+        // Append conversation history (text-only — images never kept in history)
         for turn in history {
             messages.push(LlmMessage {
                 role: turn.role.clone(),
                 content: turn.content.clone(),
+                images_b64: Vec::new(),
             });
         }
 
@@ -60,9 +69,17 @@ impl PromptBuilder {
         }
         user_msg.push_str(user_input);
 
+        // Attach the fallback screenshot (if any) to this user turn only.
+        let images_b64 = screen
+            .screenshot_b64
+            .as_ref()
+            .map(|b| vec![b.clone()])
+            .unwrap_or_default();
+
         messages.push(LlmMessage {
             role: "user".to_string(),
             content: user_msg,
+            images_b64,
         });
 
         (system, messages)
@@ -77,9 +94,12 @@ Rules:
    Bad: "Click File > Save As"
    Good: "Where do you usually save files in this app? Check the menu bar."
 
-2. You can SEE the student's screen. Reference what you see specifically.
+2. You can SEE the student's screen. A screenshot and/or UI tree is attached
+   to every user message. ALWAYS use it — never say "I can't see" or "I can't
+   access a screenshot". Reference what you see specifically, by exact label.
    Bad: "What app are you using?"
    Good: "I see you have VS Code open with main.py — nice."
+   Good: "In the top-right I see a gear icon labeled Settings — try that."
 
 3. Keep responses SHORT. You are talking, not writing an essay.
    Max 2-3 sentences per response. If they need more, they will ask.
@@ -117,6 +137,11 @@ Rules:
             let _ = write!(out, "UI Tree:\n{}\n", tree);
         } else {
             out.push_str("(no UI tree available)\n");
+        }
+        if screen.screenshot_b64.is_some() {
+            out.push_str(
+                "(screenshot attached — this app has a thin AX tree, use the image to see what the user is looking at)\n",
+            );
         }
         out.push('\n');
         out
@@ -339,6 +364,44 @@ mod tests {
         assert_eq!(messages.len(), 21);
         assert_eq!(messages[0].content, "message 0");
         assert!(messages.last().unwrap().content.ends_with("newest"));
+    }
+
+    #[test]
+    fn test_build_attaches_screenshot_on_user_turn() {
+        let pb = PromptBuilder::new();
+        let mut screen = sample_screen();
+        screen.screenshot_b64 = Some("FAKE_B64_IMAGE".to_string());
+        let (_, messages) = pb.build(&screen, None, &[], "What's on screen?");
+        let last = messages.last().unwrap();
+        assert_eq!(last.images_b64.len(), 1);
+        assert_eq!(last.images_b64[0], "FAKE_B64_IMAGE");
+        // Context block should hint about the screenshot
+        assert!(last.content.contains("screenshot attached"));
+    }
+
+    #[test]
+    fn test_build_no_screenshot_when_absent() {
+        let pb = PromptBuilder::new();
+        let screen = sample_screen(); // no screenshot_b64
+        let (_, messages) = pb.build(&screen, None, &[], "Hi");
+        assert!(messages.last().unwrap().images_b64.is_empty());
+    }
+
+    #[test]
+    fn test_build_history_messages_never_carry_images() {
+        let pb = PromptBuilder::new();
+        let mut screen = sample_screen();
+        screen.screenshot_b64 = Some("img".to_string());
+        let history = vec![ConversationTurn {
+            role: "user".to_string(),
+            content: "earlier".to_string(),
+            timestamp_ms: 1,
+            screen_summary: None,
+        }];
+        let (_, messages) = pb.build(&screen, None, &history, "now");
+        // Only the last (current) message has images
+        assert!(messages[0].images_b64.is_empty());
+        assert_eq!(messages.last().unwrap().images_b64.len(), 1);
     }
 
     #[test]

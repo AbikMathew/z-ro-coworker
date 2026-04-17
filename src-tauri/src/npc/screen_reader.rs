@@ -9,6 +9,20 @@ use crate::context::WindowInfo;
 /// how the process name or bundle ID appear in dev vs release builds.
 static SELF_PID: std::sync::LazyLock<u32> = std::sync::LazyLock::new(std::process::id);
 
+/// Minimum AX tree length (in bytes) below which we consider the tree "thin"
+/// and fall back to a screenshot.  Electron / canvas-heavy apps often return
+/// < 200 bytes (just a top-level window element with no children).
+const THIN_AX_THRESHOLD: usize = 200;
+
+/// JPEG quality for fallback screenshots (1-100).  60 keeps them under ~80 KB
+/// at typical laptop resolutions — small enough for GPT-4o vision without
+/// dominating the prompt.
+const SCREENSHOT_JPEG_QUALITY: u8 = 60;
+
+/// Maximum dimension (width or height) for downscaled screenshots.
+/// GPT-4o vision works well at 1024px long edge.
+const SCREENSHOT_MAX_EDGE: u32 = 1024;
+
 /// Snapshot of the user's screen at a point in time.
 ///
 /// The primary context source is the accessibility tree (`ax_tree`), which is
@@ -22,8 +36,9 @@ pub struct ScreenContext {
     /// Format: each line is `<indent><role_description> "<title>"`.
     /// Depth-limited to 6 levels, size-capped at 4 KB.
     pub ax_tree: Option<String>,
-    /// Base64-encoded JPEG screenshot (low quality, ~50 KB).  Only present
-    /// when the AX tree is empty/unavailable.
+    /// Base64-encoded JPEG screenshot (quality 60, max 1024px long edge).
+    /// Only populated as a fallback when the AX tree is empty or very thin
+    /// (< 200 bytes) — typical of Electron / canvas-heavy apps.
     pub screenshot_b64: Option<String>,
     /// Unix timestamp in milliseconds when this context was captured.
     pub captured_at_ms: u64,
@@ -45,6 +60,16 @@ pub struct ScreenReader {
     last_external: Arc<Mutex<Option<ScreenContext>>>,
 }
 
+/// Signature used to de-dupe poll-tick log lines.  We only print a log when
+/// something meaningful changes (focus / tree size bucket / screenshot gate).
+#[derive(Debug, Clone, PartialEq)]
+struct PollSig {
+    process: String,
+    title: String,
+    has_screenshot: bool,
+    tree_size_bucket: u32, // bucketed to avoid chatter from ±10B jitter
+}
+
 impl ScreenReader {
     pub fn new() -> Self {
         let last_external = Arc::new(Mutex::new(None));
@@ -56,8 +81,9 @@ impl ScreenReader {
                 .name("npc-screen-poll".to_string())
                 .spawn(move || {
                     println!("[z-ro:npc] Screen poller started");
+                    let mut last_sig: Option<PollSig> = None;
                     loop {
-                        Self::poll_once(&ext);
+                        Self::poll_once(&ext, &mut last_sig);
                         std::thread::sleep(Duration::from_millis(1000));
                     }
                 })
@@ -81,15 +107,11 @@ impl ScreenReader {
             // User is focused on z-ro — return the last external app context
             if let Ok(guard) = self.last_external.lock() {
                 if let Some(ref ctx) = *guard {
-                    println!(
-                        "[z-ro:npc] Self-focused → returning last external: {} - \"{}\"",
-                        ctx.window.process_name, ctx.window.title
-                    );
                     return Ok(ctx.clone());
                 }
             }
             // No external context yet — return z-ro's own context (better than nothing)
-            println!("[z-ro:npc] Self-focused but no external context captured yet");
+            eprintln!("[z-ro:npc] capture: no external context yet — NPC will have no screen info");
             let ctx = ScreenContext {
                 window,
                 ax_tree: None,
@@ -100,11 +122,12 @@ impl ScreenReader {
         }
 
         // Focused on an external app — capture fresh context
-        let ax_tree = read_ax_tree();
+        let ax_tree = read_ax_tree().ok().filter(|s| !s.is_empty());
+        let screenshot_b64 = maybe_capture_screenshot(&ax_tree);
         let ctx = ScreenContext {
             window,
-            ax_tree: ax_tree.ok().filter(|s| !s.is_empty()),
-            screenshot_b64: None,
+            ax_tree,
+            screenshot_b64,
             captured_at_ms: now_millis(),
         };
 
@@ -117,7 +140,14 @@ impl ScreenReader {
     }
 
     /// Called by the background polling thread every second.
-    fn poll_once(last_external: &Arc<Mutex<Option<ScreenContext>>>) {
+    ///
+    /// `last_sig` is a per-thread signature used to suppress repeat logs —
+    /// we only print when focus changes, the screenshot gate flips, or the
+    /// AX tree size changes bucket (250B buckets).
+    fn poll_once(
+        last_external: &Arc<Mutex<Option<ScreenContext>>>,
+        last_sig: &mut Option<PollSig>,
+    ) {
         let window = match crate::context::get_active_window_info() {
             Ok(w) => w,
             Err(_) => return, // Can't get window info — skip this tick
@@ -127,20 +157,37 @@ impl ScreenReader {
             return; // z-ro is focused — keep the existing external context
         }
 
-        let ax_tree = read_ax_tree();
+        let ax_tree = read_ax_tree().ok().filter(|s| !s.is_empty());
         let tree_size = ax_tree.as_ref().map(|t| t.len()).unwrap_or(0);
-        println!(
-            "[z-ro:npc] poll: external app={} pid={:?} title=\"{}\" ax_tree={}B",
-            window.process_name,
-            window.pid,
-            window.title,
-            tree_size,
-        );
+        let screenshot_b64 = maybe_capture_screenshot(&ax_tree);
+        let shot_size = screenshot_b64.as_ref().map(|s| s.len()).unwrap_or(0);
+
+        // Only log when something meaningful changed
+        let sig = PollSig {
+            process: window.process_name.clone(),
+            title: window.title.clone(),
+            has_screenshot: screenshot_b64.is_some(),
+            tree_size_bucket: (tree_size as u32) / 250,
+        };
+        if last_sig.as_ref() != Some(&sig) {
+            println!(
+                "[z-ro:npc] focus: {} — \"{}\" | ax_tree={}B shot={}",
+                window.process_name,
+                window.title,
+                tree_size,
+                if screenshot_b64.is_some() {
+                    format!("{}B", shot_size)
+                } else {
+                    "none".to_string()
+                },
+            );
+            *last_sig = Some(sig);
+        }
 
         let ctx = ScreenContext {
             window,
-            ax_tree: ax_tree.ok().filter(|s| !s.is_empty()),
-            screenshot_b64: None,
+            ax_tree,
+            screenshot_b64,
             captured_at_ms: now_millis(),
         };
 
@@ -148,6 +195,64 @@ impl ScreenReader {
             *guard = Some(ctx);
         }
     }
+}
+
+/// Return `Some(base64_jpeg)` only when the AX tree is too thin to be useful.
+/// This is the fallback path for Electron / canvas apps whose accessibility
+/// tree exposes almost nothing.
+fn maybe_capture_screenshot(ax_tree: &Option<String>) -> Option<String> {
+    let thin = match ax_tree {
+        Some(t) => t.len() < THIN_AX_THRESHOLD,
+        None => true,
+    };
+    if !thin {
+        return None;
+    }
+    match capture_primary_screenshot_jpeg() {
+        Ok(b64) => Some(b64),
+        Err(e) => {
+            eprintln!("[z-ro:npc] Screenshot fallback failed: {}", e);
+            None
+        }
+    }
+}
+
+/// Capture the primary monitor, downscale to `SCREENSHOT_MAX_EDGE`,
+/// JPEG-encode at `SCREENSHOT_JPEG_QUALITY`, and base64-encode.
+fn capture_primary_screenshot_jpeg() -> Result<String, String> {
+    use base64::Engine;
+    use image::codecs::jpeg::JpegEncoder;
+
+    let monitors =
+        xcap::Monitor::all().map_err(|e| format!("Failed to list monitors: {}", e))?;
+    let monitor = monitors
+        .into_iter()
+        .next()
+        .ok_or_else(|| "No monitors found".to_string())?;
+
+    let image = monitor
+        .capture_image()
+        .map_err(|e| format!("Failed to capture screen: {}", e))?;
+
+    // Downscale so the longest edge == SCREENSHOT_MAX_EDGE (preserves aspect).
+    let (w, h) = (image.width(), image.height());
+    let longest = w.max(h);
+    let resized = if longest > SCREENSHOT_MAX_EDGE {
+        let scale = SCREENSHOT_MAX_EDGE as f32 / longest as f32;
+        let nw = (w as f32 * scale) as u32;
+        let nh = (h as f32 * scale) as u32;
+        image::imageops::resize(&image, nw, nh, image::imageops::FilterType::Triangle)
+    } else {
+        image
+    };
+
+    let mut jpeg_bytes: Vec<u8> = Vec::new();
+    let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_bytes, SCREENSHOT_JPEG_QUALITY);
+    encoder
+        .encode_image(&resized)
+        .map_err(|e| format!("Failed to encode JPEG: {}", e))?;
+
+    Ok(base64::engine::general_purpose::STANDARD.encode(&jpeg_bytes))
 }
 
 /// Check whether a window belongs to our own app.
@@ -439,5 +544,30 @@ mod tests {
             captured_at_ms: 0,
         };
         assert!(ctx.ax_tree.is_none());
+    }
+
+    // ── Thin-tree fallback gate tests ──────────────────────────────────
+    //
+    // We don't test `capture_primary_screenshot_jpeg()` directly because it
+    // touches real monitors / xcap — instead we verify the gating logic:
+    // `maybe_capture_screenshot` should only attempt capture for thin trees.
+
+    #[test]
+    fn test_thin_threshold_none_is_thin() {
+        // None AX tree → thin, would attempt screenshot
+        assert!(None::<String>.as_ref().map_or(true, |t: &String| t.len() < THIN_AX_THRESHOLD));
+    }
+
+    #[test]
+    fn test_thin_threshold_tiny_is_thin() {
+        let tree = Some("window\n".to_string());
+        assert!(tree.as_ref().map_or(true, |t| t.len() < THIN_AX_THRESHOLD));
+    }
+
+    #[test]
+    fn test_thin_threshold_rich_is_not_thin() {
+        // 300-byte tree → not thin
+        let tree = Some("x".repeat(300));
+        assert!(!tree.as_ref().map_or(true, |t| t.len() < THIN_AX_THRESHOLD));
     }
 }

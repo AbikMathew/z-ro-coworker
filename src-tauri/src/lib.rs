@@ -37,6 +37,9 @@ pub fn run() {
     let api_key = std::env::var("OPENAI_API_KEY").unwrap_or_default();
     println!("[z-ro] OpenAI API key: {}", if api_key.is_empty() { "NOT SET" } else { "configured" });
 
+    let groq_api_key = std::env::var("GROQ_API_KEY").unwrap_or_default();
+    println!("[z-ro] Groq API key: {}", if groq_api_key.is_empty() { "NOT SET" } else { "configured" });
+
     // Shared TaskMachine: used by both task commands and NPC coordinator
     let task_machine = Arc::new(Mutex::new(TaskMachine::new(tasks_dir)));
 
@@ -48,7 +51,30 @@ pub fn run() {
     let llm_provider = Box::new(
         npc::llm_providers::openai::OpenAiLlm::new(npc_api_key, npc_model.clone()),
     );
-    let pipeline = npc::voice::pipeline::VoicePipeline::new(None, None, llm_provider);
+
+    // STT: only wire if Groq key is configured
+    let stt_provider: Option<Box<dyn npc::voice::stt::SttProvider>> = if !groq_api_key.is_empty() {
+        println!("[z-ro:npc] STT: Groq Whisper enabled");
+        Some(Box::new(
+            npc::stt_providers::groq_whisper::GroqWhisperStt::new(groq_api_key.clone()),
+        ))
+    } else {
+        println!("[z-ro:npc] STT: disabled (no GROQ_API_KEY)");
+        None
+    };
+
+    // TTS: only wire if OpenAI key is configured
+    let tts_provider: Option<Box<dyn npc::voice::tts::TtsProvider>> = if !api_key.is_empty() {
+        println!("[z-ro:npc] TTS: OpenAI tts-1 enabled (voice=onyx)");
+        Some(Box::new(
+            npc::tts_providers::openai_tts::OpenAiTts::new(api_key.clone()),
+        ))
+    } else {
+        println!("[z-ro:npc] TTS: disabled (no OPENAI_API_KEY)");
+        None
+    };
+
+    let pipeline = npc::voice::pipeline::VoicePipeline::new(stt_provider, tts_provider, llm_provider);
     let npc_coordinator = npc::NpcCoordinator::new(pipeline, task_machine.clone());
 
     println!(
@@ -91,6 +117,7 @@ pub fn run() {
             commands::npc::npc_start_listening,
             commands::npc::npc_stop_listening,
             commands::npc::npc_ask_text,
+            commands::npc::npc_ask_voice,
             commands::npc::npc_get_status,
             commands::npc::npc_interrupt,
         ])

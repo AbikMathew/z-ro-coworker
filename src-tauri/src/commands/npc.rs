@@ -1,4 +1,6 @@
-use crate::npc::coordinator::{NpcCoordinator, NpcStatus};
+use base64::Engine;
+
+use crate::npc::coordinator::{NpcCoordinator, NpcStatus, VoiceAskResult};
 use std::sync::Arc;
 use tauri::State;
 
@@ -55,4 +57,19 @@ pub async fn npc_interrupt(
     coordinator: State<'_, Arc<NpcCoordinator>>,
 ) -> Result<(), String> {
     coordinator.interrupt().await
+}
+
+/// Process a voice turn: base64-encoded audio bytes in, transcript + TTS audio out.
+///
+/// `filename` is a hint for the STT provider (e.g. `"audio.webm"`).
+#[tauri::command]
+pub async fn npc_ask_voice(
+    audio_b64: String,
+    filename: String,
+    coordinator: State<'_, Arc<NpcCoordinator>>,
+) -> Result<VoiceAskResult, String> {
+    let audio_bytes = base64::engine::general_purpose::STANDARD
+        .decode(audio_b64.as_bytes())
+        .map_err(|e| format!("Invalid base64 audio: {}", e))?;
+    coordinator.ask_voice(audio_bytes, filename).await
 }

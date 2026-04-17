@@ -1,18 +1,29 @@
 use async_trait::async_trait;
-use tokio::sync::mpsc;
+
+/// The result of a TTS synthesis: complete audio bytes plus mime type.
+///
+/// We collect the full audio rather than streaming chunks to the frontend
+/// because browser playback of streamed compressed audio requires
+/// MediaSource Extensions, which is a significant complication for a
+/// marginal latency win (TTS synth is typically 0.5–1.5 s).
+#[derive(Debug, Clone)]
+pub struct TtsAudio {
+    /// MIME type of the audio (e.g. `"audio/mpeg"` for MP3).
+    pub mime: String,
+    /// Encoded audio bytes ready to be played by an HTML Audio element
+    /// (as a data URL or Blob).
+    pub bytes: Vec<u8>,
+}
 
 /// Text-to-Speech provider trait.
 ///
-/// Implementations convert text into audio chunks streamed through an mpsc
-/// channel for low-latency playback.  Phase 1 is text-only so no provider is
-/// wired yet — Phase 2 adds OpenAI TTS.
+/// Implementations convert text into a complete audio buffer.  The
+/// returned `mime` tells the frontend how to play the bytes (e.g. via
+/// `new Audio("data:audio/mpeg;base64,...")`).
 #[async_trait]
 pub trait TtsProvider: Send + Sync {
-    /// Convert text to PCM audio (24 kHz, mono, i16 LE).
-    ///
-    /// Returns a receiver that yields audio chunks as they become available.
-    /// The channel is closed when synthesis is complete.
-    async fn synthesize(&self, text: &str) -> Result<mpsc::Receiver<Vec<u8>>, String>;
+    /// Synthesize the given text.
+    async fn synthesize(&self, text: &str) -> Result<TtsAudio, String>;
 
     /// Human-readable name for logging / status display.
     fn name(&self) -> &str;

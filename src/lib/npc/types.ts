@@ -15,3 +15,13 @@ export interface ChatMessage {
   role: "user" | "npc";
   content: string;
 }
+
+/** Result of a voice turn (STT → LLM → TTS). */
+export interface VoiceAskResult {
+  user_transcript: string;
+  assistant_text: string;
+  /** Base64-encoded audio bytes; empty if TTS is disabled. */
+  audio_b64: string;
+  /** MIME type of `audio_b64` (e.g. "audio/mpeg"); empty when audio is empty. */
+  audio_mime: string;
+}

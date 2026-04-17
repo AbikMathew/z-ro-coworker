@@ -9,18 +9,33 @@ use super::conversation::{ConversationMemory, ConversationTurn};
 use super::screen_reader::ScreenReader;
 use super::voice::pipeline::VoicePipeline;
 
+// ── Voice result type ──────────────────────────────────────────────────
+
+/// Result of a voice turn returned to the frontend.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VoiceAskResult {
+    /// What the user said (STT transcript).
+    pub user_transcript: String,
+    /// Zee's text reply.
+    pub assistant_text: String,
+    /// Base64-encoded audio bytes ready to play.  Empty if no TTS provider.
+    pub audio_b64: String,
+    /// MIME type of `audio_b64` (e.g. `"audio/mpeg"`).  Empty when audio is empty.
+    pub audio_mime: String,
+}
+
 // ── Public types ───────────────────────────────────────────────────────
 
 /// NPC lifecycle states.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum NpcState {
-    /// Waiting in tray, not listening.
+    /// Waiting, not actively processing.
     Idle,
-    /// Mic is hot, capturing audio (Phase 2).
+    /// Frontend is capturing mic audio (push-to-talk active).
     Listening,
     /// Processing user input through the pipeline.
     Thinking,
-    /// TTS audio playing back (Phase 2).
+    /// TTS audio is being played back on the frontend.
     Speaking,
     /// Something went wrong.
     Error(String),
@@ -238,7 +253,122 @@ impl NpcCoordinator {
         }
     }
 
-    /// Interrupt the NPC (Phase 2: stop TTS playback).
+    /// Process a voice question: audio in → transcript → LLM → audio out.
+    ///
+    /// Mirrors `ask_text` but:
+    /// - Transitions through `Listening` → `Thinking` → `Speaking`
+    /// - Takes raw audio bytes (any format supported by STT provider)
+    /// - Returns both the assistant text and the synthesized reply audio
+    pub async fn ask_voice(
+        &self,
+        audio_bytes: Vec<u8>,
+        audio_filename: String,
+    ) -> Result<VoiceAskResult, String> {
+        use base64::Engine;
+
+        self.set_state(NpcState::Thinking);
+        let start = std::time::Instant::now();
+
+        // Capture screen context
+        let screen = self.screen_reader.capture().unwrap_or_else(|e| {
+            eprintln!("[z-ro:npc] Screen capture failed: {}", e);
+            super::screen_reader::ScreenContext {
+                window: crate::context::WindowInfo {
+                    title: "Unknown".to_string(),
+                    process_name: "Unknown".to_string(),
+                    bundle_id: None,
+                    pid: None,
+                },
+                ax_tree: None,
+                screenshot_b64: None,
+                captured_at_ms: 0,
+            }
+        });
+
+        // Read task state
+        let task_state = self
+            .task_machine
+            .lock()
+            .map_err(|e| format!("TaskMachine lock failed: {}", e))?
+            .get_state();
+
+        // Get conversation history
+        let history: Vec<ConversationTurn> = {
+            let mem = self.conversation.lock().await;
+            mem.recent(10).to_vec()
+        };
+
+        // Run the full voice pipeline
+        let voice_result = self
+            .pipeline
+            .process_voice_turn(
+                &audio_bytes,
+                &audio_filename,
+                &screen,
+                task_state.as_ref(),
+                &history,
+            )
+            .await;
+
+        match voice_result {
+            Ok(vt) => {
+                let elapsed = start.elapsed();
+                println!(
+                    "[z-ro:npc] voice pipeline | total={}ms transcript=\"{}\" audio={}B",
+                    elapsed.as_millis(),
+                    vt.turn.user_transcript,
+                    vt.audio_bytes.len()
+                );
+
+                // Store conversation turns
+                let now_ms = now_millis();
+                let screen_summary =
+                    format!("{} - {}", screen.window.process_name, screen.window.title);
+                {
+                    let mut mem = self.conversation.lock().await;
+                    mem.push(ConversationTurn {
+                        role: "user".to_string(),
+                        content: vt.turn.user_transcript.clone(),
+                        timestamp_ms: now_ms,
+                        screen_summary: Some(screen_summary.clone()),
+                    });
+                    mem.push(ConversationTurn {
+                        role: "assistant".to_string(),
+                        content: vt.turn.assistant_text.clone(),
+                        timestamp_ms: now_ms + 1,
+                        screen_summary: Some(screen_summary),
+                    });
+                }
+
+                // Briefly transition through Speaking so the frontend can
+                // show the audio indicator, then back to Idle.
+                if !vt.audio_bytes.is_empty() {
+                    self.set_state(NpcState::Speaking);
+                }
+                let audio_b64 = if vt.audio_bytes.is_empty() {
+                    String::new()
+                } else {
+                    base64::engine::general_purpose::STANDARD.encode(&vt.audio_bytes)
+                };
+                self.set_state(NpcState::Idle);
+
+                Ok(VoiceAskResult {
+                    user_transcript: vt.turn.user_transcript,
+                    assistant_text: vt.turn.assistant_text,
+                    audio_b64,
+                    audio_mime: vt.audio_mime,
+                })
+            }
+            Err(e) => {
+                eprintln!("[z-ro:npc] Voice pipeline error: {}", e);
+                self.set_state(NpcState::Error(e.clone()));
+                Err(e)
+            }
+        }
+    }
+
+    /// Interrupt the NPC.  Resets state to Idle — the frontend is
+    /// responsible for stopping any in-flight audio playback on its side.
     pub async fn interrupt(&self) -> Result<(), String> {
         self.set_state(NpcState::Idle);
         Ok(())
@@ -249,16 +379,26 @@ impl NpcCoordinator {
         self.conversation.lock().await.clear();
     }
 
-    // ── Phase 2 stubs ──────────────────────────────────────────────────
+    // ── Listening state hooks ──────────────────────────────────────────
+    //
+    // Actual mic capture happens on the frontend via MediaRecorder — these
+    // commands just update the state so the UI can show the right indicator.
+    // The audio bytes are delivered later through `ask_voice`.
 
-    /// Push-to-talk: start capturing mic audio (Phase 2).
+    /// Frontend started capturing mic audio.  Updates state to Listening.
     pub async fn start_listening(&self) -> Result<(), String> {
-        Err("Voice input not yet implemented (Phase 2)".to_string())
+        if !self.pipeline.has_stt() {
+            return Err("STT provider not configured (set GROQ_API_KEY)".to_string());
+        }
+        self.set_state(NpcState::Listening);
+        Ok(())
     }
 
-    /// Push-to-talk: stop capturing, trigger pipeline (Phase 2).
+    /// Frontend stopped capturing (before bytes arrive).  Returns to Idle;
+    /// `ask_voice` will drive the next state transitions.
     pub async fn stop_listening(&self) -> Result<(), String> {
-        Err("Voice input not yet implemented (Phase 2)".to_string())
+        self.set_state(NpcState::Idle);
+        Ok(())
     }
 
     // ── Internal ───────────────────────────────────────────────────────
@@ -391,18 +531,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_start_listening_returns_phase2_error() {
+    async fn test_start_listening_errors_without_stt() {
+        // Coordinator built with MockLlm but no STT — should refuse to
+        // transition to Listening.
         let coord = make_coordinator("hello");
         let result = coord.start_listening().await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Phase 2"));
+        assert!(result.unwrap_err().contains("STT"));
+        // State should remain Idle
+        assert_eq!(coord.get_status().state, NpcState::Idle);
     }
 
     #[tokio::test]
-    async fn test_stop_listening_returns_phase2_error() {
+    async fn test_stop_listening_resets_to_idle() {
         let coord = make_coordinator("hello");
-        let result = coord.stop_listening().await;
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("Phase 2"));
+        coord.stop_listening().await.unwrap();
+        assert_eq!(coord.get_status().state, NpcState::Idle);
+    }
+
+    #[tokio::test]
+    async fn test_ask_voice_errors_without_stt() {
+        let coord = make_coordinator("hello");
+        let err = coord
+            .ask_voice(vec![1, 2, 3], "audio.webm".to_string())
+            .await
+            .unwrap_err();
+        assert!(err.contains("STT"));
     }
 }

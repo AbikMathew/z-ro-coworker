@@ -42,6 +42,17 @@ pub struct TurnResult {
     pub overlay_commands: Vec<OverlayCommand>,
 }
 
+/// The result of a voice-in/voice-out turn: a `TurnResult` plus the
+/// synthesized TTS audio ready for the frontend to play.
+#[derive(Debug, Clone)]
+pub struct VoiceTurnResult {
+    pub turn: TurnResult,
+    /// MIME type of `audio_bytes` (e.g. `"audio/mpeg"`).
+    pub audio_mime: String,
+    /// Complete audio bytes from TTS (empty if no TTS configured).
+    pub audio_bytes: Vec<u8>,
+}
+
 /// An overlay command embedded in the LLM response as a fenced code block.
 ///
 /// ```text
@@ -70,9 +81,7 @@ pub struct OverlayCommand {
 /// Text-only pipeline (Phase 1):
 ///   typed text → prompt builder → LLM stream → parse overlays → return text
 pub struct VoicePipeline {
-    #[allow(dead_code)]
     stt: Option<Box<dyn SttProvider>>,
-    #[allow(dead_code)]
     tts: Option<Box<dyn TtsProvider>>,
     llm: Box<dyn LlmProvider>,
     prompt_builder: PromptBuilder,
@@ -111,6 +120,21 @@ impl VoicePipeline {
         // Build prompt
         let (system, messages) = self.prompt_builder.build(screen, task, history, text);
 
+        // Concise per-turn digest so you can confirm at a glance what the
+        // model received: which screen, whether a screenshot was attached,
+        // whether a task is active, how much history was included.
+        let ax_bytes = screen.ax_tree.as_ref().map(|t| t.len()).unwrap_or(0);
+        let img_count: usize = messages.iter().map(|m| m.images_b64.len()).sum();
+        println!(
+            "[z-ro:npc] llm→{} | app=\"{}\" ax={}B images={} task={} history={}",
+            self.llm.name(),
+            screen.window.process_name,
+            ax_bytes,
+            img_count,
+            task.map(|t| t.task_id.as_str()).unwrap_or("none"),
+            history.len(),
+        );
+
         // Stream LLM response
         let mut rx = self.llm.stream_chat(&system, &messages).await?;
         let mut full_response = String::new();
@@ -134,6 +158,64 @@ impl VoicePipeline {
     /// Get the name of the current LLM provider.
     pub fn llm_name(&self) -> &str {
         self.llm.name()
+    }
+
+    /// Whether STT is configured (voice input is available).
+    pub fn has_stt(&self) -> bool {
+        self.stt.is_some()
+    }
+
+    /// Whether TTS is configured (voice output is available).
+    pub fn has_tts(&self) -> bool {
+        self.tts.is_some()
+    }
+
+    /// Process a full voice turn: audio → STT → LLM → TTS.
+    ///
+    /// 1. Transcribe audio to text via STT
+    /// 2. Run the text turn through the LLM pipeline
+    /// 3. Synthesize the clean (non-overlay) reply to audio via TTS
+    ///
+    /// If TTS is not configured, the returned audio is empty and `audio_mime`
+    /// is `""` — the caller should fall back to displaying text only.
+    pub async fn process_voice_turn(
+        &self,
+        audio_bytes: &[u8],
+        audio_filename: &str,
+        screen: &ScreenContext,
+        task: Option<&TaskState>,
+        history: &[ConversationTurn],
+    ) -> Result<VoiceTurnResult, String> {
+        let stt = self
+            .stt
+            .as_ref()
+            .ok_or_else(|| "STT provider not configured".to_string())?;
+
+        // 1. Transcribe
+        let transcript = stt.transcribe(audio_bytes, audio_filename).await?;
+        if transcript.trim().is_empty() {
+            return Err("STT returned empty transcript (silence?)".to_string());
+        }
+
+        // 2. LLM turn (reuses text-turn logic)
+        let turn = self
+            .process_text_turn(&transcript, screen, task, history)
+            .await?;
+
+        // 3. TTS — synthesize the displayed (overlay-stripped) text
+        let (audio_mime, audio_bytes) = match &self.tts {
+            Some(tts) if !turn.assistant_text.trim().is_empty() => {
+                let synth = tts.synthesize(&turn.assistant_text).await?;
+                (synth.mime, synth.bytes)
+            }
+            _ => (String::new(), Vec::new()),
+        };
+
+        Ok(VoiceTurnResult {
+            turn,
+            audio_mime,
+            audio_bytes,
+        })
     }
 }
 
@@ -470,5 +552,138 @@ That should work!"#;
         };
         let pipeline = VoicePipeline::new(None, None, Box::new(llm));
         assert_eq!(pipeline.llm_name(), "mock-llm");
+    }
+
+    // ── Voice turn tests ───────────────────────────────────────────────
+
+    struct MockStt {
+        transcript: String,
+    }
+
+    #[async_trait]
+    impl SttProvider for MockStt {
+        async fn transcribe(
+            &self,
+            _audio: &[u8],
+            _filename: &str,
+        ) -> Result<String, String> {
+            Ok(self.transcript.clone())
+        }
+        fn name(&self) -> &str {
+            "mock-stt"
+        }
+    }
+
+    struct MockTts {
+        mime: String,
+        bytes: Vec<u8>,
+    }
+
+    #[async_trait]
+    impl TtsProvider for MockTts {
+        async fn synthesize(
+            &self,
+            _text: &str,
+        ) -> Result<crate::npc::voice::tts::TtsAudio, String> {
+            Ok(crate::npc::voice::tts::TtsAudio {
+                mime: self.mime.clone(),
+                bytes: self.bytes.clone(),
+            })
+        }
+        fn name(&self) -> &str {
+            "mock-tts"
+        }
+    }
+
+    #[tokio::test]
+    async fn test_has_stt_has_tts_defaults_false() {
+        let pipeline = VoicePipeline::new(
+            None,
+            None,
+            Box::new(MockLlm { response: "x".to_string() }),
+        );
+        assert!(!pipeline.has_stt());
+        assert!(!pipeline.has_tts());
+    }
+
+    #[tokio::test]
+    async fn test_process_voice_turn_full_pipeline() {
+        let stt = Box::new(MockStt {
+            transcript: "What am I looking at?".to_string(),
+        });
+        let tts = Box::new(MockTts {
+            mime: "audio/mpeg".to_string(),
+            bytes: vec![0xFF, 0xFB, 0x90, 0x00], // fake MP3 header bytes
+        });
+        let llm = Box::new(MockLlm {
+            response: "You're looking at VS Code.".to_string(),
+        });
+        let pipeline = VoicePipeline::new(Some(stt), Some(tts), llm);
+        assert!(pipeline.has_stt());
+        assert!(pipeline.has_tts());
+
+        let screen = make_screen();
+        let result = pipeline
+            .process_voice_turn(b"audio-bytes", "audio.webm", &screen, None, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(result.turn.user_transcript, "What am I looking at?");
+        assert!(result.turn.assistant_text.contains("VS Code"));
+        assert_eq!(result.audio_mime, "audio/mpeg");
+        assert_eq!(result.audio_bytes, vec![0xFF, 0xFB, 0x90, 0x00]);
+    }
+
+    #[tokio::test]
+    async fn test_process_voice_turn_errors_without_stt() {
+        let pipeline = VoicePipeline::new(
+            None,
+            None,
+            Box::new(MockLlm { response: "x".to_string() }),
+        );
+        let screen = make_screen();
+        let err = pipeline
+            .process_voice_turn(b"x", "audio.webm", &screen, None, &[])
+            .await
+            .unwrap_err();
+        assert!(err.contains("STT"));
+    }
+
+    #[tokio::test]
+    async fn test_process_voice_turn_empty_transcript_errors() {
+        let stt = Box::new(MockStt {
+            transcript: "   ".to_string(), // whitespace only
+        });
+        let pipeline = VoicePipeline::new(
+            Some(stt),
+            None,
+            Box::new(MockLlm { response: "x".to_string() }),
+        );
+        let screen = make_screen();
+        let err = pipeline
+            .process_voice_turn(b"silent", "audio.webm", &screen, None, &[])
+            .await
+            .unwrap_err();
+        assert!(err.to_lowercase().contains("empty") || err.to_lowercase().contains("silence"));
+    }
+
+    #[tokio::test]
+    async fn test_process_voice_turn_without_tts_returns_empty_audio() {
+        let stt = Box::new(MockStt {
+            transcript: "Hello".to_string(),
+        });
+        let pipeline = VoicePipeline::new(
+            Some(stt),
+            None, // no TTS
+            Box::new(MockLlm { response: "Hi".to_string() }),
+        );
+        let screen = make_screen();
+        let result = pipeline
+            .process_voice_turn(b"x", "audio.webm", &screen, None, &[])
+            .await
+            .unwrap();
+        assert!(result.turn.assistant_text.contains("Hi"));
+        assert_eq!(result.audio_mime, "");
+        assert!(result.audio_bytes.is_empty());
     }
 }
