@@ -1,1 +1,97 @@
 @import "tailwindcss";
+@import "@fontsource-variable/inter";
+@import "@fontsource-variable/plus-jakarta-sans";
+
+/* ──────────────────────────────────────────────────────────────────────
+   Design tokens for the Z-RO Cowork dashboard.
+
+   Most of the visual identity lives here so individual components can
+   stay clean and still look uniform. Category gradients power the task
+   card thumbnails; the brand accent drives focus rings, active states,
+   and the hero hero-ish details.
+   ──────────────────────────────────────────────────────────────────── */
+:root {
+  /* Typography */
+  --font-sans: "Inter Variable", system-ui, -apple-system, sans-serif;
+  --font-display: "Plus Jakarta Sans Variable", var(--font-sans);
+
+  /* Brand accent — violet → cyan */
+  --accent-from: #7c3aed;
+  --accent-to: #06b6d4;
+  --accent: linear-gradient(135deg, var(--accent-from), var(--accent-to));
+
+  /* Surfaces */
+  --bg: #0b0d12;
+  --bg-elevated: #14171f;
+  --bg-card: rgba(255, 255, 255, 0.04);
+  --bg-card-hover: rgba(255, 255, 255, 0.07);
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
+
+  /* Text */
+  --fg: #f8fafc;
+  --fg-muted: #94a3b8;
+  --fg-dim: #64748b;
+
+  /* Category gradients — keyed so frontend can look up by category name */
+  --cat-coding: linear-gradient(135deg, #6366f1, #8b5cf6);
+  --cat-git: linear-gradient(135deg, #f97316, #ef4444);
+  --cat-jira: linear-gradient(135deg, #2563eb, #0ea5e9);
+  --cat-communication: linear-gradient(135deg, #10b981, #059669);
+  --cat-productivity: linear-gradient(135deg, #f59e0b, #f43f5e);
+  --cat-default: linear-gradient(135deg, #64748b, #475569);
+
+  /* Difficulty accents */
+  --dif-beginner: #10b981;
+  --dif-intermediate: #f59e0b;
+  --dif-advanced: #ef4444;
+}
+
+html,
+body {
+  font-family: var(--font-sans);
+  background: var(--bg);
+  color: var(--fg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+h1,
+h2,
+h3,
+.display {
+  font-family: var(--font-display);
+  letter-spacing: -0.02em;
+}
+
+/* Utility: category → gradient background.
+   Used as `<div class="cat-bg" data-category="git">` */
+.cat-bg[data-category="coding"] { background: var(--cat-coding); }
+.cat-bg[data-category="git"] { background: var(--cat-git); }
+.cat-bg[data-category="jira"] { background: var(--cat-jira); }
+.cat-bg[data-category="communication"] { background: var(--cat-communication); }
+.cat-bg[data-category="productivity"] { background: var(--cat-productivity); }
+.cat-bg { background: var(--cat-default); }
+
+/* Global focus ring — consistent across every interactive element */
+*:focus-visible {
+  outline: 2px solid var(--accent-from);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Thin scrollbars, dark themed */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 6px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.14);
+}

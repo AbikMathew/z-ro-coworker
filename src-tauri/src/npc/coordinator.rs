@@ -1,13 +1,16 @@
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::AppHandle;
 use tokio::sync::{watch, Mutex};
 
 use crate::task_engine::machine::TaskMachine;
 
 use super::conversation::{ConversationMemory, ConversationTurn};
+use super::llm_providers::{self, ApiKeys, ModelInfo};
+use super::overlay_driver::{self, AutoHideState};
 use super::screen_reader::ScreenReader;
-use super::voice::pipeline::VoicePipeline;
+use super::voice::pipeline::{OverlayCommand, VoicePipeline};
 
 // ── Voice result type ──────────────────────────────────────────────────
 
@@ -89,6 +92,15 @@ pub struct NpcCoordinator {
     conversation: Arc<Mutex<ConversationMemory>>,
     pipeline: Arc<VoicePipeline>,
     task_machine: Arc<std::sync::Mutex<TaskMachine>>,
+    /// API keys used to build providers at runtime (model-swap path).
+    api_keys: Arc<ApiKeys>,
+    /// Tauri AppHandle — installed after Tauri finishes `.setup()` via
+    /// `set_app_handle`. Needed by the overlay driver to emit events and
+    /// show/hide the overlay window.
+    app_handle: OnceLock<AppHandle>,
+    /// Handle to the pending overlay auto-hide timer. Each new overlay
+    /// command batch cancels the prior timer so the 15 s countdown restarts.
+    auto_hide: AutoHideState,
 }
 
 impl NpcCoordinator {
@@ -96,7 +108,11 @@ impl NpcCoordinator {
     ///
     /// `task_machine` is shared with the Tauri command layer so both the NPC
     /// and the task commands can read/write the current task state.
-    pub fn new(pipeline: VoicePipeline, task_machine: Arc<std::sync::Mutex<TaskMachine>>) -> Self {
+    pub fn new(
+        pipeline: VoicePipeline,
+        task_machine: Arc<std::sync::Mutex<TaskMachine>>,
+        api_keys: Arc<ApiKeys>,
+    ) -> Self {
         let (state_tx, state_rx) = watch::channel(NpcState::Idle);
         Self {
             state_tx,
@@ -105,7 +121,54 @@ impl NpcCoordinator {
             conversation: Arc::new(Mutex::new(ConversationMemory::new(20))),
             pipeline: Arc::new(pipeline),
             task_machine,
+            api_keys,
+            app_handle: OnceLock::new(),
+            auto_hide: overlay_driver::new_auto_hide_state(),
         }
+    }
+
+    /// Install the Tauri `AppHandle` so the overlay driver can emit events
+    /// and show/hide the overlay window, and the screen reader can push
+    /// `context-update` events to the frontend. Called once from `lib.rs`
+    /// inside `.setup(...)`. Subsequent calls are no-ops.
+    pub fn set_app_handle(&self, app: AppHandle) {
+        self.screen_reader.set_app_handle(app.clone());
+        let _ = self.app_handle.set(app);
+    }
+
+    /// Internal: dispatch a batch of overlay commands if the AppHandle is
+    /// installed. Logs and swallows errors — overlay failures must never
+    /// break a turn.
+    fn dispatch_overlay(&self, commands: &[OverlayCommand]) {
+        if commands.is_empty() {
+            return;
+        }
+        let Some(app) = self.app_handle.get() else {
+            eprintln!(
+                "[z-ro:npc] overlay: {} command(s) dropped — AppHandle not yet installed",
+                commands.len()
+            );
+            return;
+        };
+        if let Err(e) = overlay_driver::apply(app, commands, &self.auto_hide) {
+            eprintln!("[z-ro:npc] overlay apply failed: {}", e);
+        }
+    }
+
+    /// List all LLM models that can be selected (filtered by configured API keys).
+    pub fn list_available_models(&self) -> Vec<ModelInfo> {
+        llm_providers::available_models(&self.api_keys)
+    }
+
+    /// Hot-swap the active LLM provider. The next turn will use it.
+    pub fn set_llm(&self, provider: &str, model: &str) -> Result<(), String> {
+        let llm = llm_providers::build_provider(provider, model, &self.api_keys)?;
+        self.pipeline.set_llm(llm);
+        println!(
+            "[z-ro:npc] LLM swapped → {}:{}",
+            provider, model
+        );
+        Ok(())
     }
 
     // ── Public API ─────────────────────────────────────────────────────
@@ -206,6 +269,10 @@ impl NpcCoordinator {
                     });
                 }
 
+                // Push any overlay commands the LLM emitted through to the
+                // overlay window. Safe to call on an empty Vec — it's a no-op.
+                self.dispatch_overlay(&turn_result.overlay_commands);
+
                 self.set_state(NpcState::Idle);
                 Ok(turn_result.assistant_text)
             }
@@ -220,7 +287,7 @@ impl NpcCoordinator {
     /// Get current NPC status for frontend.
     pub fn get_status(&self) -> NpcStatus {
         let state = self.state_rx.borrow().clone();
-        let model_name = self.pipeline.llm_name().to_string();
+        let model_name = self.pipeline.llm_name();
 
         // Read task info without panicking on lock failure
         let (active_task, current_step) = self
@@ -340,6 +407,10 @@ impl NpcCoordinator {
                     });
                 }
 
+                // Push any overlay commands the LLM emitted through to the
+                // overlay window. Safe to call on an empty Vec — it's a no-op.
+                self.dispatch_overlay(&vt.turn.overlay_commands);
+
                 // Briefly transition through Speaking so the frontend can
                 // show the audio indicator, then back to Idle.
                 if !vt.audio_bytes.is_empty() {
@@ -452,12 +523,12 @@ mod tests {
         let llm = MockLlm {
             response: response.to_string(),
         };
-        let pipeline = VoicePipeline::new(None, None, Box::new(llm));
+        let pipeline = VoicePipeline::new(None, None, Arc::new(llm));
         // Use an empty dir — no tasks loaded, that's fine
         let tm = Arc::new(std::sync::Mutex::new(TaskMachine::new(PathBuf::from(
             "/nonexistent",
         ))));
-        NpcCoordinator::new(pipeline, tm)
+        NpcCoordinator::new(pipeline, tm, Arc::new(ApiKeys::default()))
     }
 
     #[test]

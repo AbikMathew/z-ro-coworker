@@ -114,11 +114,35 @@ Rules:
 
 6. If you genuinely do not know something, say so. Do not make stuff up.
 
-7. If you want to highlight something on screen, emit an overlay command as a fenced code block:
+7. POINTING AT THINGS (overlay commands):
+   When a visual pointer would help the student, emit an overlay command as a
+   fenced code block. Coordinates are NORMALIZED floats 0.0–1.0 relative to
+   the attached screenshot: (0,0) is the top-left corner, (1,1) is bottom-right.
+   Look at the screenshot carefully and pick accurate coordinates.
+
+   Arrow pointing at a button or icon (most common):
    ```overlay
-   {"action":"highlight","target":"<ax_element_description>","color":"blue"}
+   {"action":"arrow","x":0.82,"y":0.91,"text":"Click Opus 4.7"}
    ```
-   Only do this when it is genuinely helpful, not every response."#
+
+   Box around a region:
+   ```overlay
+   {"action":"box","x":0.75,"y":0.88,"width":0.18,"height":0.06,"color":"green","text":"Model picker"}
+   ```
+
+   Clear any existing overlay when moving on:
+   ```overlay
+   {"action":"clear"}
+   ```
+
+   Rules for overlays:
+   - Emit them ONLY when pointing visually would help more than words.
+   - Study the screenshot before guessing coordinates — a wrong point is
+     worse than no point. If you can't locate the target with confidence,
+     describe it in words instead.
+   - Each arrow/box needs `x` and `y` (and for box, `width` and `height`).
+   - The overlay and the sentence around it must agree — do not say
+     "top-right" and then emit coordinates in the bottom-left."#
             .to_string()
     }
 
@@ -286,10 +310,22 @@ mod tests {
         let sys = pb.system_prompt();
         // Must contain the "don't give direct answers" rule
         assert!(sys.contains("NEVER give direct answers"));
-        // Must mention overlay command format
-        assert!(sys.contains("overlay"));
         // Must mention keeping responses short
         assert!(sys.contains("SHORT"));
+    }
+
+    #[test]
+    fn test_system_prompt_teaches_normalized_overlay_schema() {
+        let pb = PromptBuilder::new();
+        let sys = pb.system_prompt();
+        // Coord-based overlay schema
+        assert!(sys.contains("overlay"));
+        assert!(sys.contains("NORMALIZED"));
+        assert!(sys.contains("arrow"));
+        assert!(sys.contains("box"));
+        assert!(sys.contains("clear"));
+        // Must show the 0.0-1.0 coordinate convention
+        assert!(sys.contains("0.0") || sys.contains("0.0–1.0") || sys.contains("0,0"));
     }
 
     #[test]

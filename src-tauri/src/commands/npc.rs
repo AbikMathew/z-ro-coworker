@@ -1,6 +1,7 @@
 use base64::Engine;
 
 use crate::npc::coordinator::{NpcCoordinator, NpcStatus, VoiceAskResult};
+use crate::npc::llm_providers::ModelInfo;
 use std::sync::Arc;
 use tauri::State;
 
@@ -72,4 +73,22 @@ pub async fn npc_ask_voice(
         .decode(audio_b64.as_bytes())
         .map_err(|e| format!("Invalid base64 audio: {}", e))?;
     coordinator.ask_voice(audio_bytes, filename).await
+}
+
+/// List all LLM models that can be chosen (filtered by which API keys are configured).
+#[tauri::command]
+pub async fn npc_list_models(
+    coordinator: State<'_, Arc<NpcCoordinator>>,
+) -> Result<Vec<ModelInfo>, String> {
+    Ok(coordinator.list_available_models())
+}
+
+/// Hot-swap the active LLM provider. The next NPC turn will use it.
+#[tauri::command]
+pub async fn npc_set_model(
+    provider: String,
+    model: String,
+    coordinator: State<'_, Arc<NpcCoordinator>>,
+) -> Result<(), String> {
+    coordinator.set_llm(&provider, &model)
 }

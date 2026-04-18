@@ -1,5 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { NpcStatus, NpcState, VoiceAskResult } from "./types";
+import type { NpcStatus, NpcState, VoiceAskResult, ModelInfo } from "./types";
+
+/** localStorage key for the user's selected provider/model. */
+const LS_MODEL_KEY = "zro:npc:model";
 
 /**
  * Reactive NPC store built on Svelte 5 runes.
@@ -97,6 +100,63 @@ class NpcStore {
       this.status.state = { Error: String(e) };
       throw e;
     }
+  }
+
+  // ── Model management ─────────────────────────────────────────────────
+  //
+  // Populated lazily from the backend (filtered by which API keys are
+  // configured). The Settings page reads `availableModels` and calls
+  // `setModel()` on change; selection is persisted to localStorage so the
+  // choice survives restarts even though the Rust side defaults back to
+  // its env-configured provider on boot.
+
+  /** Cached list of selectable models (filled by `listModels()`). */
+  availableModels: ModelInfo[] = $state([]);
+
+  /** Fetch the selectable model list from the backend. */
+  async listModels(): Promise<ModelInfo[]> {
+    try {
+      this.availableModels = await invoke<ModelInfo[]>("npc_list_models");
+      return this.availableModels;
+    } catch (e) {
+      console.error("[npc] Failed to list models:", e);
+      return [];
+    }
+  }
+
+  /**
+   * Hot-swap the active LLM. Persists the choice to localStorage so the
+   * Settings UI can re-select it after a reload.
+   */
+  async setModel(provider: string, model: string): Promise<void> {
+    await invoke("npc_set_model", { provider, model });
+    await this.refresh();
+    try {
+      localStorage.setItem(
+        LS_MODEL_KEY,
+        JSON.stringify({ provider, model }),
+      );
+    } catch {
+      /* localStorage may be unavailable — non-fatal */
+    }
+  }
+
+  /**
+   * Read the persisted `{provider, model}` selection, or `null` if the
+   * user hasn't changed the default. Called by Settings on mount.
+   */
+  getPersistedModel(): { provider: string; model: string } | null {
+    try {
+      const raw = localStorage.getItem(LS_MODEL_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (typeof parsed?.provider === "string" && typeof parsed?.model === "string") {
+        return parsed;
+      }
+    } catch {
+      /* corrupted entry — ignore */
+    }
+    return null;
   }
 }
 

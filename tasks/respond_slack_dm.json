@@ -1,0 +1,56 @@
+{
+  "id": "respond_slack_dm",
+  "title": "Reply to a Slack DM",
+  "description": "Practice responding professionally to a teammate's direct message.",
+  "xp_reward": 15,
+  "icon": "💬",
+  "category": "communication",
+  "difficulty": "beginner",
+  "est_minutes": 3,
+  "steps": [
+    {
+      "id": "open_slack",
+      "instruction": "Open Slack (desktop app or web)",
+      "hints": [
+        "Make sure you're in the correct workspace — check the workspace switcher on the far left"
+      ],
+      "validation": {
+        "type": "app_context",
+        "match": {
+          "window_title_contains": "Slack",
+          "process_name": "Slack"
+        },
+        "fallback_ai": true
+      },
+      "overlay": null,
+      "xp": 5
+    },
+    {
+      "id": "find_dm",
+      "instruction": "Go to 'Direct messages' and open an unread DM (or start a new one with yourself)",
+      "hints": [
+        "Unread threads have a bold name with a blue dot",
+        "You can DM yourself by clicking your own name to test safely"
+      ],
+      "validation": null,
+      "overlay": {
+        "type": "tooltip",
+        "text": "Open the 'Direct messages' section on the left",
+        "position": "left"
+      },
+      "xp": 5
+    },
+    {
+      "id": "reply",
+      "instruction": "Type a clear, friendly reply and send it",
+      "hints": [
+        "Be concise — professional tone doesn't mean stiff",
+        "If you need more time, say so: 'Let me check and get back to you by 3pm'",
+        "Shift+Enter for a line break, Enter to send"
+      ],
+      "validation": null,
+      "overlay": null,
+      "xp": 5
+    }
+  ]
+}

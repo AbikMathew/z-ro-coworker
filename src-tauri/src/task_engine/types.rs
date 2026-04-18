@@ -7,6 +7,29 @@ pub struct Task {
     pub description: String,
     pub xp_reward: u32,
     pub steps: Vec<Step>,
+
+    // ── Optional presentation fields (WS-C / dashboard) ────────────────
+    //
+    // These are all `#[serde(default)]` so existing task JSON files
+    // without these fields continue to deserialize cleanly. The frontend
+    // uses them to theme task cards and show at-a-glance metadata.
+    /// Emoji or short glyph shown as the card thumbnail (e.g. "🎫").
+    #[serde(default)]
+    pub icon: Option<String>,
+    /// One of `"coding" | "git" | "jira" | "communication" | "productivity"`.
+    /// Drives the task card's gradient theme.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// `"beginner" | "intermediate" | "advanced"` — shown as a chip.
+    #[serde(default)]
+    pub difficulty: Option<String>,
+    /// Approximate completion time in minutes.
+    #[serde(default)]
+    pub est_minutes: Option<u32>,
+    /// Optional CSS color or gradient override (takes precedence over
+    /// `category`-derived gradient).
+    #[serde(default)]
+    pub accent_color: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

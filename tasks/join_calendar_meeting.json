@@ -1,0 +1,56 @@
+{
+  "id": "join_calendar_meeting",
+  "title": "Join a Meeting",
+  "description": "Find a meeting on your calendar and join it — the basic daily ritual of remote work.",
+  "xp_reward": 15,
+  "icon": "📅",
+  "category": "productivity",
+  "difficulty": "beginner",
+  "est_minutes": 3,
+  "steps": [
+    {
+      "id": "open_calendar",
+      "instruction": "Open Google Calendar, Outlook Calendar, or your company's calendar app",
+      "hints": [
+        "On Mac: Cmd+Space → 'Calendar'",
+        "Or go to calendar.google.com in your browser"
+      ],
+      "validation": {
+        "type": "app_context",
+        "match": {
+          "window_title_contains": "Calendar",
+          "process_name": null
+        },
+        "fallback_ai": true
+      },
+      "overlay": null,
+      "xp": 5
+    },
+    {
+      "id": "find_meeting",
+      "instruction": "Find any upcoming meeting on your calendar and click into it",
+      "hints": [
+        "Today's meetings are usually highlighted at the top or in the day view",
+        "If no meetings exist, create a test one with 'Google Meet' enabled"
+      ],
+      "validation": null,
+      "overlay": {
+        "type": "tooltip",
+        "text": "Click a meeting block on the calendar grid",
+        "position": "center"
+      },
+      "xp": 5
+    },
+    {
+      "id": "click_join",
+      "instruction": "Click the 'Join with Google Meet' / 'Join Zoom' link on the event",
+      "hints": [
+        "It's usually a prominent button inside the event details popup",
+        "Check your mic/camera settings before joining — but not now, we're just practicing"
+      ],
+      "validation": null,
+      "overlay": null,
+      "xp": 5
+    }
+  ]
+}

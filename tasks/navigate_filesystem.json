@@ -3,6 +3,10 @@
   "title": "Navigate Your File System",
   "description": "Learn to navigate files and folders like a pro using your file explorer.",
   "xp_reward": 20,
+  "icon": "🗂️",
+  "category": "productivity",
+  "difficulty": "beginner",
+  "est_minutes": 4,
   "steps": [
     {
       "id": "open_finder",

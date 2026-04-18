@@ -6,5 +6,6 @@ pub mod voice;
 pub mod llm_providers;
 pub mod stt_providers;
 pub mod tts_providers;
+pub mod overlay_driver;
 
 pub use coordinator::NpcCoordinator;

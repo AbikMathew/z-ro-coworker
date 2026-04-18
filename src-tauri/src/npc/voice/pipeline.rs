@@ -1,3 +1,5 @@
+use std::sync::{Arc, RwLock};
+
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
@@ -55,18 +57,37 @@ pub struct VoiceTurnResult {
 
 /// An overlay command embedded in the LLM response as a fenced code block.
 ///
+/// Coordinates are NORMALIZED (0.0 – 1.0) relative to the screenshot the LLM
+/// was shown. `(0,0)` is top-left, `(1,1)` is bottom-right. The overlay driver
+/// is responsible for mapping them onto actual pixel coordinates using the
+/// current monitor size.
+///
 /// ```text
 /// ```overlay
-/// {"action":"highlight","target":"button:Submit","color":"blue"}
+/// {"action":"arrow","x":0.82,"y":0.91,"text":"Click Opus 4.7"}
 /// ```
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverlayCommand {
+    /// `"arrow"` | `"box"` | `"tooltip"` | `"clear"`
     pub action: String,
+    /// Normalized 0.0–1.0 horizontal position (center for arrow/tooltip,
+    /// top-left for box).
     #[serde(default)]
-    pub target: Option<String>,
+    pub x: Option<f32>,
+    /// Normalized 0.0–1.0 vertical position.
+    #[serde(default)]
+    pub y: Option<f32>,
+    /// Normalized 0.0–1.0 width (only for `"box"`).
+    #[serde(default)]
+    pub width: Option<f32>,
+    /// Normalized 0.0–1.0 height (only for `"box"`).
+    #[serde(default)]
+    pub height: Option<f32>,
+    /// Optional label/tooltip text drawn near the target.
     #[serde(default)]
     pub text: Option<String>,
+    /// Optional color hint (CSS color string or named color).
     #[serde(default)]
     pub color: Option<String>,
 }
@@ -83,7 +104,10 @@ pub struct OverlayCommand {
 pub struct VoicePipeline {
     stt: Option<Box<dyn SttProvider>>,
     tts: Option<Box<dyn TtsProvider>>,
-    llm: Box<dyn LlmProvider>,
+    /// The LLM lives behind an `RwLock<Arc<…>>` so the settings UI can
+    /// hot-swap the model at runtime. Reads briefly clone the `Arc`, drop the
+    /// lock, then await — the lock is never held across `.await`.
+    llm: RwLock<Arc<dyn LlmProvider>>,
     prompt_builder: PromptBuilder,
 }
 
@@ -94,14 +118,30 @@ impl VoicePipeline {
     pub fn new(
         stt: Option<Box<dyn SttProvider>>,
         tts: Option<Box<dyn TtsProvider>>,
-        llm: Box<dyn LlmProvider>,
+        llm: Arc<dyn LlmProvider>,
     ) -> Self {
         Self {
             stt,
             tts,
-            llm,
+            llm: RwLock::new(llm),
             prompt_builder: PromptBuilder::new(),
         }
+    }
+
+    /// Hot-swap the active LLM provider. Subsequent turns will use `llm`.
+    pub fn set_llm(&self, llm: Arc<dyn LlmProvider>) {
+        if let Ok(mut slot) = self.llm.write() {
+            *slot = llm;
+        }
+    }
+
+    /// Briefly lock the slot, clone the Arc, and return it. The lock is never
+    /// held across `.await`, so swaps can't deadlock the pipeline.
+    fn current_llm(&self) -> Arc<dyn LlmProvider> {
+        self.llm
+            .read()
+            .expect("VoicePipeline llm lock poisoned")
+            .clone()
     }
 
     /// Process a text-only turn (no STT/TTS).
@@ -120,6 +160,10 @@ impl VoicePipeline {
         // Build prompt
         let (system, messages) = self.prompt_builder.build(screen, task, history, text);
 
+        // Snapshot the current LLM once per turn — the settings UI may swap
+        // it mid-session, but each turn gets a consistent provider.
+        let llm = self.current_llm();
+
         // Concise per-turn digest so you can confirm at a glance what the
         // model received: which screen, whether a screenshot was attached,
         // whether a task is active, how much history was included.
@@ -127,7 +171,7 @@ impl VoicePipeline {
         let img_count: usize = messages.iter().map(|m| m.images_b64.len()).sum();
         println!(
             "[z-ro:npc] llm→{} | app=\"{}\" ax={}B images={} task={} history={}",
-            self.llm.name(),
+            llm.name(),
             screen.window.process_name,
             ax_bytes,
             img_count,
@@ -136,7 +180,7 @@ impl VoicePipeline {
         );
 
         // Stream LLM response
-        let mut rx = self.llm.stream_chat(&system, &messages).await?;
+        let mut rx = llm.stream_chat(&system, &messages).await?;
         let mut full_response = String::new();
         while let Some(chunk) = rx.recv().await {
             full_response.push_str(&chunk);
@@ -155,9 +199,11 @@ impl VoicePipeline {
         })
     }
 
-    /// Get the name of the current LLM provider.
-    pub fn llm_name(&self) -> &str {
-        self.llm.name()
+    /// Get the name of the current LLM provider. Allocates a new `String`
+    /// because the underlying `&str` is borrowed from whichever provider is
+    /// behind the lock — the reference can't outlive the guard.
+    pub fn llm_name(&self) -> String {
+        self.current_llm().name().to_string()
     }
 
     /// Whether STT is configured (voice input is available).
@@ -287,15 +333,17 @@ mod tests {
     fn test_parse_overlay_commands() {
         let text = r#"Look at the submit button.
 ```overlay
-{"action":"highlight","target":"button:Submit","color":"blue"}
+{"action":"arrow","x":0.5,"y":0.75,"color":"blue","text":"Click here"}
 ```
 Does that help?"#;
 
         let cmds = parse_overlay_commands(text);
         assert_eq!(cmds.len(), 1);
-        assert_eq!(cmds[0].action, "highlight");
-        assert_eq!(cmds[0].target.as_deref(), Some("button:Submit"));
+        assert_eq!(cmds[0].action, "arrow");
+        assert!((cmds[0].x.unwrap() - 0.5).abs() < f32::EPSILON);
+        assert!((cmds[0].y.unwrap() - 0.75).abs() < f32::EPSILON);
         assert_eq!(cmds[0].color.as_deref(), Some("blue"));
+        assert_eq!(cmds[0].text.as_deref(), Some("Click here"));
     }
 
     #[test]
@@ -308,17 +356,18 @@ Does that help?"#;
     fn test_parse_multiple_overlays() {
         let text = r#"Check these:
 ```overlay
-{"action":"highlight","target":"button:OK"}
+{"action":"box","x":0.1,"y":0.2,"width":0.3,"height":0.05}
 ```
 and also
 ```overlay
-{"action":"tooltip","target":"field:Name","text":"Enter your name here"}
+{"action":"tooltip","x":0.5,"y":0.4,"text":"Enter your name here"}
 ```
 Got it?"#;
 
         let cmds = parse_overlay_commands(text);
         assert_eq!(cmds.len(), 2);
-        assert_eq!(cmds[0].action, "highlight");
+        assert_eq!(cmds[0].action, "box");
+        assert_eq!(cmds[0].width, Some(0.3));
         assert_eq!(cmds[1].action, "tooltip");
         assert_eq!(cmds[1].text.as_deref(), Some("Enter your name here"));
     }
@@ -346,7 +395,10 @@ Done."#;
         let cmds = parse_overlay_commands(text);
         assert_eq!(cmds.len(), 1);
         assert_eq!(cmds[0].action, "clear");
-        assert!(cmds[0].target.is_none());
+        assert!(cmds[0].x.is_none());
+        assert!(cmds[0].y.is_none());
+        assert!(cmds[0].width.is_none());
+        assert!(cmds[0].height.is_none());
         assert!(cmds[0].text.is_none());
         assert!(cmds[0].color.is_none());
     }
@@ -367,7 +419,7 @@ Not an overlay."#;
     fn test_parse_overlay_unclosed_block() {
         let text = r#"Oops:
 ```overlay
-{"action":"highlight","target":"x"}
+{"action":"arrow","x":0.1,"y":0.2}
 This block is never closed."#;
 
         let cmds = parse_overlay_commands(text);
@@ -380,7 +432,7 @@ This block is never closed."#;
     fn test_strip_overlay_blocks() {
         let text = r#"Check the button.
 ```overlay
-{"action":"highlight","target":"x"}
+{"action":"arrow","x":0.5,"y":0.5}
 ```
 Got it?"#;
 
@@ -411,7 +463,7 @@ Easy right?"#;
     fn test_strip_multiple_overlays() {
         let text = r#"First:
 ```overlay
-{"action":"highlight"}
+{"action":"arrow","x":0.1,"y":0.2}
 ```
 Then:
 ```overlay
@@ -470,7 +522,7 @@ Done."#;
         let llm = MockLlm {
             response: "I can see you have VS Code open with main.rs!".to_string(),
         };
-        let pipeline = VoicePipeline::new(None, None, Box::new(llm));
+        let pipeline = VoicePipeline::new(None, None, Arc::new(llm));
         let screen = make_screen();
 
         let result = pipeline
@@ -487,13 +539,13 @@ Done."#;
     async fn test_pipeline_text_turn_with_overlay() {
         let response = r#"Click the save button.
 ```overlay
-{"action":"highlight","target":"button:Save","color":"green"}
+{"action":"arrow","x":0.82,"y":0.91,"color":"green","text":"Save"}
 ```
 That should work!"#;
         let llm = MockLlm {
             response: response.to_string(),
         };
-        let pipeline = VoicePipeline::new(None, None, Box::new(llm));
+        let pipeline = VoicePipeline::new(None, None, Arc::new(llm));
         let screen = make_screen();
 
         let result = pipeline
@@ -503,11 +555,10 @@ That should work!"#;
 
         // Overlay parsed
         assert_eq!(result.overlay_commands.len(), 1);
-        assert_eq!(result.overlay_commands[0].action, "highlight");
-        assert_eq!(
-            result.overlay_commands[0].target.as_deref(),
-            Some("button:Save")
-        );
+        assert_eq!(result.overlay_commands[0].action, "arrow");
+        assert!((result.overlay_commands[0].x.unwrap() - 0.82).abs() < 0.001);
+        assert!((result.overlay_commands[0].y.unwrap() - 0.91).abs() < 0.001);
+        assert_eq!(result.overlay_commands[0].text.as_deref(), Some("Save"));
 
         // Overlay block stripped from displayed text
         assert!(!result.assistant_text.contains("```overlay"));
@@ -520,7 +571,7 @@ That should work!"#;
         let llm = MockLlm {
             response: "Yes, continue from where we left off.".to_string(),
         };
-        let pipeline = VoicePipeline::new(None, None, Box::new(llm));
+        let pipeline = VoicePipeline::new(None, None, Arc::new(llm));
         let screen = make_screen();
         let history = vec![
             crate::npc::conversation::ConversationTurn {
@@ -550,7 +601,7 @@ That should work!"#;
         let llm = MockLlm {
             response: "test".to_string(),
         };
-        let pipeline = VoicePipeline::new(None, None, Box::new(llm));
+        let pipeline = VoicePipeline::new(None, None, Arc::new(llm));
         assert_eq!(pipeline.llm_name(), "mock-llm");
     }
 
@@ -600,7 +651,7 @@ That should work!"#;
         let pipeline = VoicePipeline::new(
             None,
             None,
-            Box::new(MockLlm { response: "x".to_string() }),
+            Arc::new(MockLlm { response: "x".to_string() }),
         );
         assert!(!pipeline.has_stt());
         assert!(!pipeline.has_tts());
@@ -615,7 +666,7 @@ That should work!"#;
             mime: "audio/mpeg".to_string(),
             bytes: vec![0xFF, 0xFB, 0x90, 0x00], // fake MP3 header bytes
         });
-        let llm = Box::new(MockLlm {
+        let llm = Arc::new(MockLlm {
             response: "You're looking at VS Code.".to_string(),
         });
         let pipeline = VoicePipeline::new(Some(stt), Some(tts), llm);
@@ -639,7 +690,7 @@ That should work!"#;
         let pipeline = VoicePipeline::new(
             None,
             None,
-            Box::new(MockLlm { response: "x".to_string() }),
+            Arc::new(MockLlm { response: "x".to_string() }),
         );
         let screen = make_screen();
         let err = pipeline
@@ -657,7 +708,7 @@ That should work!"#;
         let pipeline = VoicePipeline::new(
             Some(stt),
             None,
-            Box::new(MockLlm { response: "x".to_string() }),
+            Arc::new(MockLlm { response: "x".to_string() }),
         );
         let screen = make_screen();
         let err = pipeline
@@ -675,7 +726,7 @@ That should work!"#;
         let pipeline = VoicePipeline::new(
             Some(stt),
             None, // no TTS
-            Box::new(MockLlm { response: "Hi".to_string() }),
+            Arc::new(MockLlm { response: "Hi".to_string() }),
         );
         let screen = make_screen();
         let result = pipeline

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use tauri::{AppHandle, Emitter};
 
 use crate::context::WindowInfo;
 
@@ -58,6 +60,10 @@ pub struct ScreenReader {
     /// Most recent screen context from a non-z-ro app.  Updated by the
     /// background polling thread.
     last_external: Arc<Mutex<Option<ScreenContext>>>,
+    /// Tauri AppHandle — installed after setup via `set_app_handle`.
+    /// Used to emit `context-update` events to the frontend so the UI
+    /// can display the active window without polling.
+    app_handle: Arc<OnceLock<AppHandle>>,
 }
 
 /// Signature used to de-dupe poll-tick log lines.  We only print a log when
@@ -73,24 +79,33 @@ struct PollSig {
 impl ScreenReader {
     pub fn new() -> Self {
         let last_external = Arc::new(Mutex::new(None));
+        let app_handle = Arc::new(OnceLock::new());
 
         // Spawn a background thread that continuously tracks external app focus.
         {
             let ext = last_external.clone();
+            let ah = app_handle.clone();
             std::thread::Builder::new()
                 .name("npc-screen-poll".to_string())
                 .spawn(move || {
                     println!("[z-ro:npc] Screen poller started");
                     let mut last_sig: Option<PollSig> = None;
                     loop {
-                        Self::poll_once(&ext, &mut last_sig);
+                        Self::poll_once(&ext, &mut last_sig, &ah);
                         std::thread::sleep(Duration::from_millis(1000));
                     }
                 })
                 .expect("Failed to spawn screen polling thread");
         }
 
-        Self { last_external }
+        Self { last_external, app_handle }
+    }
+
+    /// Install the Tauri `AppHandle` so the screen poller can emit
+    /// `context-update` events to the frontend. Called once from
+    /// `lib.rs` inside `.setup(...)`. Subsequent calls are no-ops.
+    pub fn set_app_handle(&self, app: AppHandle) {
+        let _ = self.app_handle.set(app);
     }
 
     /// Capture the screen context for the NPC.
@@ -147,6 +162,7 @@ impl ScreenReader {
     fn poll_once(
         last_external: &Arc<Mutex<Option<ScreenContext>>>,
         last_sig: &mut Option<PollSig>,
+        app_handle: &Arc<OnceLock<AppHandle>>,
     ) {
         let window = match crate::context::get_active_window_info() {
             Ok(w) => w,
@@ -169,7 +185,8 @@ impl ScreenReader {
             has_screenshot: screenshot_b64.is_some(),
             tree_size_bucket: (tree_size as u32) / 250,
         };
-        if last_sig.as_ref() != Some(&sig) {
+        let focus_changed = last_sig.as_ref() != Some(&sig);
+        if focus_changed {
             println!(
                 "[z-ro:npc] focus: {} — \"{}\" | ax_tree={}B shot={}",
                 window.process_name,
@@ -182,6 +199,16 @@ impl ScreenReader {
                 },
             );
             *last_sig = Some(sig);
+        }
+
+        // Push the WindowInfo to the frontend so the "What Zee sees"
+        // sidebar stays updated without the UI having to poll via IPC.
+        // Only emit when focus actually changed to avoid unnecessary
+        // event traffic.
+        if focus_changed {
+            if let Some(app) = app_handle.get() {
+                let _ = app.emit("context-update", &window);
+            }
         }
 
         let ctx = ScreenContext {

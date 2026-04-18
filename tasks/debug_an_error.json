@@ -1,0 +1,76 @@
+{
+  "id": "debug_an_error",
+  "title": "Debug an Error in VS Code",
+  "description": "Reproduce, read, and fix a runtime error — the core loop of real software work.",
+  "xp_reward": 35,
+  "icon": "🔧",
+  "category": "coding",
+  "difficulty": "intermediate",
+  "est_minutes": 10,
+  "steps": [
+    {
+      "id": "open_file",
+      "instruction": "Open any code file in VS Code (or create one) that you can intentionally break",
+      "hints": [
+        "A tiny JS/Python file is ideal — easy to reason about"
+      ],
+      "validation": {
+        "type": "app_context",
+        "match": {
+          "window_title_contains": null,
+          "process_name": "Code"
+        },
+        "fallback_ai": true
+      },
+      "overlay": null,
+      "xp": 5
+    },
+    {
+      "id": "break_it",
+      "instruction": "Deliberately introduce a bug — misspell a variable, call an undefined function, etc.",
+      "hints": [
+        "The goal is to see a real error message, not crash your system",
+        "Example: change `console.log(x)` to `console.log(xx)`"
+      ],
+      "validation": null,
+      "overlay": null,
+      "xp": 5
+    },
+    {
+      "id": "read_error",
+      "instruction": "Run the file and read the full error message carefully",
+      "hints": [
+        "Notice: the error TYPE (ReferenceError, TypeError...), the MESSAGE, and the LINE NUMBER",
+        "Stack traces read bottom-up — the top line is where it broke"
+      ],
+      "validation": null,
+      "overlay": {
+        "type": "tooltip",
+        "text": "Read the error message top-to-bottom — don't skim",
+        "position": "center"
+      },
+      "xp": 10
+    },
+    {
+      "id": "fix_it",
+      "instruction": "Fix the bug based on what the error told you, save, and re-run",
+      "hints": [
+        "If you can't tell from the message, paste it into a search engine or ask Zee",
+        "After fixing, confirm the error is gone — don't assume it worked"
+      ],
+      "validation": null,
+      "overlay": null,
+      "xp": 10
+    },
+    {
+      "id": "reflect",
+      "instruction": "Take 30 seconds: what did the error message teach you about your code?",
+      "hints": [
+        "This habit — stopping to learn from each bug — is what turns juniors into seniors"
+      ],
+      "validation": null,
+      "overlay": null,
+      "xp": 5
+    }
+  ]
+}
