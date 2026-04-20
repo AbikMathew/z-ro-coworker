@@ -46,6 +46,13 @@ pub fn create_overlay_window(app: &AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("overlay") {
         let _ = window.set_size(LogicalSize::new(width, height));
         let _ = window.set_position(LogicalPosition::new(pos_x, pos_y));
+
+        // Make the window itself click-through. On macOS this flips
+        // NSWindow.ignoresMouseEvents, so mouse input falls through to
+        // whatever app is beneath the overlay (VS Code, Chrome, etc.).
+        // Without this, even a `pointer-events: none` DOM can't save us —
+        // the webview swallows events at the OS layer.
+        let _ = window.set_ignore_cursor_events(true);
     }
 
     Ok(())

@@ -6,6 +6,8 @@
    * (XP + streak) until we wire persistent progress. The greeting rotates
    * with the time of day so the first pixel of the app feels alive.
    */
+  import ScreenPicker from "$lib/components/ScreenPicker.svelte";
+
   interface Props {
     /** Lifetime XP across all completed tasks. */
     totalXp?: number;
@@ -40,9 +42,12 @@
       {greeting}, <span class="name">{userName}</span> 👋
     </h1>
     <p class="sub">
-      Pick a task to practice. Zee will watch your screen and nudge you
-      when you get stuck.
+      Pick a task to practice. Zee watches your screen and shows you
+      exactly what to do — like a senior colleague at your desk.
     </p>
+    <div class="share-row">
+      <ScreenPicker />
+    </div>
   </div>
 
   <div class="stats">
@@ -103,6 +108,10 @@
     max-width: 540px;
     font-size: 14px;
     line-height: 1.5;
+  }
+  .share-row {
+    margin-top: 16px;
+    max-width: 420px;
   }
 
   .stats {

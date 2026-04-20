@@ -5,6 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 
 use crate::context::WindowInfo;
+use crate::npc::frame_buffer::FrameBuffer;
 
 /// Our own PID, captured at process start.  Compared against the focused
 /// app's PID to reliably detect when z-ro itself is focused — regardless of
@@ -16,14 +17,8 @@ static SELF_PID: std::sync::LazyLock<u32> = std::sync::LazyLock::new(std::proces
 /// < 200 bytes (just a top-level window element with no children).
 const THIN_AX_THRESHOLD: usize = 200;
 
-/// JPEG quality for fallback screenshots (1-100).  60 keeps them under ~80 KB
-/// at typical laptop resolutions — small enough for GPT-4o vision without
-/// dominating the prompt.
+/// JPEG quality for screenshots pulled from the SCK FrameBuffer.
 const SCREENSHOT_JPEG_QUALITY: u8 = 60;
-
-/// Maximum dimension (width or height) for downscaled screenshots.
-/// GPT-4o vision works well at 1024px long edge.
-const SCREENSHOT_MAX_EDGE: u32 = 1024;
 
 /// Snapshot of the user's screen at a point in time.
 ///
@@ -64,6 +59,10 @@ pub struct ScreenReader {
     /// Used to emit `context-update` events to the frontend so the UI
     /// can display the active window without polling.
     app_handle: Arc<OnceLock<AppHandle>>,
+    /// Shared ring of frames produced by the SCK capture stream. Empty until
+    /// the user picks a source via the native picker; the NPC silently runs
+    /// without visual context until then (AX tree only).
+    frame_buffer: FrameBuffer,
 }
 
 /// Signature used to de-dupe poll-tick log lines.  We only print a log when
@@ -72,23 +71,25 @@ pub struct ScreenReader {
 struct PollSig {
     process: String,
     title: String,
-    has_screenshot: bool,
     tree_size_bucket: u32, // bucketed to avoid chatter from ±10B jitter
 }
 
 impl ScreenReader {
-    pub fn new() -> Self {
+    pub fn new(frame_buffer: FrameBuffer) -> Self {
         let last_external = Arc::new(Mutex::new(None));
         let app_handle = Arc::new(OnceLock::new());
 
-        // Spawn a background thread that continuously tracks external app focus.
+        // Background thread tracks external app focus so the LLM always has
+        // AX-tree context from the window the user was last interacting with.
+        // It does NOT capture screenshots — that job belongs to the SCK
+        // stream which fills `frame_buffer` continuously.
         {
             let ext = last_external.clone();
             let ah = app_handle.clone();
             std::thread::Builder::new()
                 .name("npc-screen-poll".to_string())
                 .spawn(move || {
-                    println!("[z-ro:npc] Screen poller started");
+                    println!("[z-ro:npc] Screen poller started (AX-tree only)");
                     let mut last_sig: Option<PollSig> = None;
                     loop {
                         Self::poll_once(&ext, &mut last_sig, &ah);
@@ -98,7 +99,7 @@ impl ScreenReader {
                 .expect("Failed to spawn screen polling thread");
         }
 
-        Self { last_external, app_handle }
+        Self { last_external, app_handle, frame_buffer }
     }
 
     /// Install the Tauri `AppHandle` so the screen poller can emit
@@ -118,40 +119,74 @@ impl ScreenReader {
     pub fn capture(&self) -> Result<ScreenContext, String> {
         let window = crate::context::get_active_window_info()?;
 
-        if is_self_app(&window) {
-            // User is focused on z-ro — return the last external app context
+        let (window, ax_tree) = if is_self_app(&window) {
+            // User is focused on z-ro — fall back to the AX tree + window of
+            // the last external app they interacted with.
             if let Ok(guard) = self.last_external.lock() {
-                if let Some(ref ctx) = *guard {
-                    return Ok(ctx.clone());
+                if let Some(ref prev) = *guard {
+                    (prev.window.clone(), prev.ax_tree.clone())
+                } else {
+                    eprintln!(
+                        "[z-ro:npc] capture: no external context yet — \
+                         NPC will have no AX context"
+                    );
+                    (window, None)
                 }
+            } else {
+                (window, None)
             }
-            // No external context yet — return z-ro's own context (better than nothing)
-            eprintln!("[z-ro:npc] capture: no external context yet — NPC will have no screen info");
-            let ctx = ScreenContext {
-                window,
-                ax_tree: None,
-                screenshot_b64: None,
-                captured_at_ms: now_millis(),
-            };
-            return Ok(ctx);
-        }
+        } else {
+            let ax = read_ax_tree().ok().filter(|s| !s.is_empty());
+            (window, ax)
+        };
 
-        // Focused on an external app — capture fresh context
-        let ax_tree = read_ax_tree().ok().filter(|s| !s.is_empty());
-        let screenshot_b64 = maybe_capture_screenshot(&ax_tree);
+        // Screenshot comes from the SCK FrameBuffer, not from a second xcap
+        // path. Only attach when the AX tree is too thin to be useful —
+        // cloud vision tokens are the cost we're optimising for.
+        let screenshot_b64 = self.screenshot_from_buffer_if_thin(&ax_tree);
+
         let ctx = ScreenContext {
-            window,
-            ax_tree,
+            window: window.clone(),
+            ax_tree: ax_tree.clone(),
             screenshot_b64,
             captured_at_ms: now_millis(),
         };
 
-        // Also update last_external
-        if let Ok(mut guard) = self.last_external.lock() {
-            *guard = Some(ctx.clone());
+        // Refresh last_external so subsequent "z-ro is focused" turns still
+        // see fresh AX context. We do NOT cache the screenshot here — the
+        // ring buffer is already authoritative for visuals.
+        if !is_self_app(&ctx.window) {
+            if let Ok(mut guard) = self.last_external.lock() {
+                *guard = Some(ScreenContext {
+                    screenshot_b64: None,
+                    ..ctx.clone()
+                });
+            }
         }
 
         Ok(ctx)
+    }
+
+    /// Pull the latest frame out of the ring and JPEG+base64-encode it —
+    /// but only when the AX tree is too thin to drive the LLM alone.
+    /// Returns `None` when the buffer is empty (user hasn't picked a source
+    /// yet) or the AX tree is substantial enough on its own.
+    fn screenshot_from_buffer_if_thin(&self, ax_tree: &Option<String>) -> Option<String> {
+        let thin = match ax_tree {
+            Some(t) => t.len() < THIN_AX_THRESHOLD,
+            None => true,
+        };
+        if !thin {
+            return None;
+        }
+        let frame = self.frame_buffer.latest()?;
+        match frame.to_jpeg_base64(SCREENSHOT_JPEG_QUALITY) {
+            Ok(b64) => Some(b64),
+            Err(e) => {
+                eprintln!("[z-ro:npc] Frame→JPEG failed: {e}");
+                None
+            }
+        }
     }
 
     /// Called by the background polling thread every second.
@@ -175,28 +210,18 @@ impl ScreenReader {
 
         let ax_tree = read_ax_tree().ok().filter(|s| !s.is_empty());
         let tree_size = ax_tree.as_ref().map(|t| t.len()).unwrap_or(0);
-        let screenshot_b64 = maybe_capture_screenshot(&ax_tree);
-        let shot_size = screenshot_b64.as_ref().map(|s| s.len()).unwrap_or(0);
 
         // Only log when something meaningful changed
         let sig = PollSig {
             process: window.process_name.clone(),
             title: window.title.clone(),
-            has_screenshot: screenshot_b64.is_some(),
             tree_size_bucket: (tree_size as u32) / 250,
         };
         let focus_changed = last_sig.as_ref() != Some(&sig);
         if focus_changed {
             println!(
-                "[z-ro:npc] focus: {} — \"{}\" | ax_tree={}B shot={}",
-                window.process_name,
-                window.title,
-                tree_size,
-                if screenshot_b64.is_some() {
-                    format!("{}B", shot_size)
-                } else {
-                    "none".to_string()
-                },
+                "[z-ro:npc] focus: {} — \"{}\" | ax_tree={tree_size}B",
+                window.process_name, window.title,
             );
             *last_sig = Some(sig);
         }
@@ -211,10 +236,12 @@ impl ScreenReader {
             }
         }
 
+        // Cache AX context for "z-ro is focused" turns. Screenshots come
+        // from the SCK FrameBuffer, not from here.
         let ctx = ScreenContext {
             window,
             ax_tree,
-            screenshot_b64,
+            screenshot_b64: None,
             captured_at_ms: now_millis(),
         };
 
@@ -224,63 +251,9 @@ impl ScreenReader {
     }
 }
 
-/// Return `Some(base64_jpeg)` only when the AX tree is too thin to be useful.
-/// This is the fallback path for Electron / canvas apps whose accessibility
-/// tree exposes almost nothing.
-fn maybe_capture_screenshot(ax_tree: &Option<String>) -> Option<String> {
-    let thin = match ax_tree {
-        Some(t) => t.len() < THIN_AX_THRESHOLD,
-        None => true,
-    };
-    if !thin {
-        return None;
-    }
-    match capture_primary_screenshot_jpeg() {
-        Ok(b64) => Some(b64),
-        Err(e) => {
-            eprintln!("[z-ro:npc] Screenshot fallback failed: {}", e);
-            None
-        }
-    }
-}
-
-/// Capture the primary monitor, downscale to `SCREENSHOT_MAX_EDGE`,
-/// JPEG-encode at `SCREENSHOT_JPEG_QUALITY`, and base64-encode.
-fn capture_primary_screenshot_jpeg() -> Result<String, String> {
-    use base64::Engine;
-    use image::codecs::jpeg::JpegEncoder;
-
-    let monitors =
-        xcap::Monitor::all().map_err(|e| format!("Failed to list monitors: {}", e))?;
-    let monitor = monitors
-        .into_iter()
-        .next()
-        .ok_or_else(|| "No monitors found".to_string())?;
-
-    let image = monitor
-        .capture_image()
-        .map_err(|e| format!("Failed to capture screen: {}", e))?;
-
-    // Downscale so the longest edge == SCREENSHOT_MAX_EDGE (preserves aspect).
-    let (w, h) = (image.width(), image.height());
-    let longest = w.max(h);
-    let resized = if longest > SCREENSHOT_MAX_EDGE {
-        let scale = SCREENSHOT_MAX_EDGE as f32 / longest as f32;
-        let nw = (w as f32 * scale) as u32;
-        let nh = (h as f32 * scale) as u32;
-        image::imageops::resize(&image, nw, nh, image::imageops::FilterType::Triangle)
-    } else {
-        image
-    };
-
-    let mut jpeg_bytes: Vec<u8> = Vec::new();
-    let mut encoder = JpegEncoder::new_with_quality(&mut jpeg_bytes, SCREENSHOT_JPEG_QUALITY);
-    encoder
-        .encode_image(&resized)
-        .map_err(|e| format!("Failed to encode JPEG: {}", e))?;
-
-    Ok(base64::engine::general_purpose::STANDARD.encode(&jpeg_bytes))
-}
+// The legacy xcap-based screenshot path was removed in Phase 2. The SCK
+// FrameBuffer is now the single source of truth for screen pixels — frames
+// arrive there at 2 fps whenever a capture session is live.
 
 /// Check whether a window belongs to our own app.
 ///

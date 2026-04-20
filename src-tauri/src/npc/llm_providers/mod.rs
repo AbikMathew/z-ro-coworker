@@ -102,7 +102,7 @@ pub fn available_models(keys: &ApiKeys) -> Vec<ModelInfo> {
             display_name: "Claude Haiku 4.5".into(),
             vision: true,
             cost_tier: "cheap".into(),
-            notes: "Fast & cheap Claude with solid vision — great fallback.".into(),
+            notes: "Fast & cheap Claude with solid vision — the new default.".into(),
         });
         out.push(ModelInfo {
             provider: "anthropic".into(),
@@ -114,15 +114,51 @@ pub fn available_models(keys: &ApiKeys) -> Vec<ModelInfo> {
         });
         out.push(ModelInfo {
             provider: "anthropic".into(),
+            model: "claude-sonnet-4-6".into(),
+            display_name: "Claude Sonnet 4.6".into(),
+            vision: true,
+            cost_tier: "mid".into(),
+            notes: "Mid-tier pick for the Planner role — good coord accuracy.".into(),
+        });
+        out.push(ModelInfo {
+            provider: "anthropic".into(),
             model: "claude-opus-4-5".into(),
             display_name: "Claude Opus 4.5".into(),
             vision: true,
             cost_tier: "premium".into(),
-            notes: "Strongest reasoning & coordinate precision.".into(),
+            notes: "Premium reasoning.".into(),
+        });
+        out.push(ModelInfo {
+            provider: "anthropic".into(),
+            model: "claude-opus-4-7".into(),
+            display_name: "Claude Opus 4.7".into(),
+            vision: true,
+            cost_tier: "premium".into(),
+            notes: "Highest coordinate precision (Computer Use 1:1 pixels up to 2576 px).".into(),
         });
     }
 
     out
+}
+
+/// Pick the best default (provider, model) for first boot. Preference:
+/// 1. Claude Haiku 4.5 — cheap, no free-tier 429, great UI vision.
+/// 2. OpenAI GPT-4o-mini — second cheapest with vision.
+/// 3. Gemini 2.0 Flash — last resort because the free tier rate-limits
+///    fast enough to block casual testing.
+///
+/// Caller should override with a persisted user choice if available.
+pub fn pick_default_model(keys: &ApiKeys) -> Option<(String, String)> {
+    if !keys.anthropic.is_empty() {
+        return Some(("anthropic".into(), "claude-haiku-4-5".into()));
+    }
+    if !keys.openai.is_empty() {
+        return Some(("openai".into(), "gpt-4o-mini".into()));
+    }
+    if !keys.gemini.is_empty() {
+        return Some(("gemini".into(), "gemini-2.0-flash".into()));
+    }
+    None
 }
 
 /// Instantiate a provider instance from a (provider, model) pair and the
@@ -225,8 +261,50 @@ mod tests {
             groq: String::new(),
         };
         let models = available_models(&keys);
-        // 2 OpenAI + 2 Gemini + 3 Claude
-        assert_eq!(models.len(), 7);
+        // 2 OpenAI + 2 Gemini + 5 Claude (haiku-4-5, sonnet-4-5, sonnet-4-6, opus-4-5, opus-4-7)
+        assert_eq!(models.len(), 9);
+    }
+
+    #[test]
+    fn test_default_model_prefers_claude_over_gemini() {
+        // With an Anthropic key, Claude wins — Gemini free tier 429s too
+        // fast to be a good default.
+        let keys = ApiKeys {
+            anthropic: "sk-ant".into(),
+            gemini: "AI".into(),
+            ..Default::default()
+        };
+        let (p, m) = pick_default_model(&keys).unwrap();
+        assert_eq!(p, "anthropic");
+        assert_eq!(m, "claude-haiku-4-5");
+    }
+
+    #[test]
+    fn test_default_model_openai_second() {
+        let keys = ApiKeys {
+            openai: "sk".into(),
+            gemini: "AI".into(),
+            ..Default::default()
+        };
+        let (p, _m) = pick_default_model(&keys).unwrap();
+        assert_eq!(p, "openai");
+    }
+
+    #[test]
+    fn test_default_model_gemini_last() {
+        let keys = ApiKeys {
+            gemini: "AI".into(),
+            ..Default::default()
+        };
+        let (p, m) = pick_default_model(&keys).unwrap();
+        assert_eq!(p, "gemini");
+        assert_eq!(m, "gemini-2.0-flash");
+    }
+
+    #[test]
+    fn test_default_model_none_when_no_keys() {
+        let keys = ApiKeys::default();
+        assert!(pick_default_model(&keys).is_none());
     }
 
     // `Box<dyn LlmProvider>` isn't Debug, so these tests destructure by hand

@@ -161,14 +161,34 @@ fn build_request_body(
         })
         .collect();
 
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": model,
         "system": system,
         "messages": api_messages,
         "max_tokens": 512,
-        "temperature": 0.7,
         "stream": true,
-    })
+    });
+    // Opus 4.7 (and newer reasoning-class models) rejected `temperature`
+    // in April 2026 — it's controlled via `thinking` params instead.
+    // Older models (Haiku 4.5, Sonnet 4.5/4.6, Opus 4.5) still accept it
+    // and behave better with an explicit 0.7 (Claude's default is 1.0
+    // which is chattier than we want for short NPC replies).
+    if accepts_temperature(model) {
+        body["temperature"] = serde_json::json!(0.7);
+    }
+    body
+}
+
+/// Whether `temperature` is a valid request field for this model. As of
+/// April 2026 the Opus 4.7+ line dropped it in favour of `thinking`.
+/// Prefer an allow-list style check so a new unknown model doesn't get
+/// silently blocked — only the explicitly-known "no-temperature" names
+/// are stripped.
+fn accepts_temperature(model: &str) -> bool {
+    // Everything NOT in this list gets `temperature: 0.7`. Extend as
+    // Anthropic deprecates the field on more models.
+    const DEPRECATED_FOR: &[&str] = &["claude-opus-4-7"];
+    !DEPRECATED_FOR.iter().any(|m| model == *m)
 }
 
 // ── SSE parsing ────────────────────────────────────────────────────────
@@ -325,6 +345,38 @@ mod tests {
         assert_eq!(body["max_tokens"], 512);
         assert_eq!(body["temperature"], 0.7);
         assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn test_opus_4_7_omits_temperature() {
+        // Opus 4.7 returns 400 Bad Request if `temperature` is present.
+        let msgs = vec![];
+        let body = build_request_body("claude-opus-4-7", "sys", &msgs);
+        assert!(
+            body.get("temperature").is_none(),
+            "temperature should be absent for opus-4-7, got: {body}"
+        );
+        // Other fields still present.
+        assert_eq!(body["model"], "claude-opus-4-7");
+        assert_eq!(body["stream"], true);
+    }
+
+    #[test]
+    fn test_haiku_still_carries_temperature() {
+        let body = build_request_body("claude-haiku-4-5", "sys", &[]);
+        assert_eq!(body["temperature"], 0.7);
+    }
+
+    #[test]
+    fn test_accepts_temperature_allowlist_style() {
+        assert!(accepts_temperature("claude-haiku-4-5"));
+        assert!(accepts_temperature("claude-sonnet-4-6"));
+        assert!(accepts_temperature("claude-opus-4-5"));
+        assert!(!accepts_temperature("claude-opus-4-7"));
+        // Unknown future model: err on the side of sending temperature
+        // (the Anthropic API will reject if it's invalid, which surfaces
+        // a clear error message).
+        assert!(accepts_temperature("claude-future-5-0"));
     }
 
     // ── SSE parsing ────────────────────────────────────────────────────

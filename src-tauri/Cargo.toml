@@ -28,12 +28,16 @@ tokio-stream = "0.1"
 async-trait = "0.1"
 dotenvy = "0.15"
 base64 = "0.22"
-xcap = "0.0.9"
+bytes = "1"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 
-# NPC: macOS accessibility tree reading
+# NPC: macOS accessibility tree reading + native screen capture via ScreenCaptureKit.
+# `macos_14_0` feature unlocks SCContentSharingPicker (the native "which window?"
+# dialog that Zoom/Meet use). Apple gates the picker at macOS 14 Sonoma and has
+# penalised alternative paths since Sequoia, so this is the supported way in.
 [target.'cfg(target_os = "macos")'.dependencies]
 accessibility = "0.1"
 accessibility-sys = "0.1"
 core-foundation = "0.9"
+screencapturekit = { version = "1.5.4", features = ["macos_14_0", "async"] }
 

@@ -90,9 +90,11 @@ impl PromptBuilder {
         r#"You are Zee, a senior coworker at a tech company. You sit next to the student and help them learn workplace skills. You are friendly, casual, and supportive — like a colleague who has been here a few years and remembers what it was like to be new.
 
 Rules:
-1. NEVER give direct answers. Ask guiding questions instead.
-   Bad: "Click File > Save As"
-   Good: "Where do you usually save files in this app? Check the menu bar."
+1. Be DIRECTLY HELPFUL. Tell the user exactly where to click and what to type.
+   You are a senior colleague sitting next to them, not a tutor.
+   Bad:  "Where do you usually save files in this app?"
+   Good: "Click the File menu in the top-left, then choose Save As."
+   Give one concrete next step, not a lecture — no Socratic questions.
 
 2. You can SEE the student's screen. A screenshot and/or UI tree is attached
    to every user message. ALWAYS use it — never say "I can't see" or "I can't
@@ -232,6 +234,7 @@ mod tests {
                 validation: None,
                 overlay: None,
                 xp: 10,
+                milestones: Vec::new(),
             },
             total_steps: 5,
             status: TaskStatus::InProgress,
@@ -308,10 +311,20 @@ mod tests {
     fn test_system_prompt_contains_key_rules() {
         let pb = PromptBuilder::new();
         let sys = pb.system_prompt();
-        // Must contain the "don't give direct answers" rule
-        assert!(sys.contains("NEVER give direct answers"));
-        // Must mention keeping responses short
+        // Must tell the model to be directly helpful (not Socratic).
+        assert!(sys.contains("DIRECTLY HELPFUL"));
+        // Must mention keeping responses short.
         assert!(sys.contains("SHORT"));
+    }
+
+    #[test]
+    fn test_system_prompt_is_not_socratic() {
+        let pb = PromptBuilder::new();
+        let sys = pb.system_prompt();
+        // Guard against regressions: the prompt must NOT instruct the model
+        // to withhold direct answers or ask guiding questions instead.
+        assert!(!sys.contains("NEVER give direct answers"));
+        assert!(!sys.contains("Ask guiding questions instead"));
     }
 
     #[test]

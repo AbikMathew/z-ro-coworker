@@ -83,12 +83,31 @@ pub async fn npc_list_models(
     Ok(coordinator.list_available_models())
 }
 
-/// Hot-swap the active LLM provider. The next NPC turn will use it.
+/// Hot-swap the active LLM provider and persist the choice so it survives
+/// a restart. The next NPC turn uses the new provider.
 #[tauri::command]
 pub async fn npc_set_model(
     provider: String,
     model: String,
     coordinator: State<'_, Arc<NpcCoordinator>>,
+    app: tauri::AppHandle,
 ) -> Result<(), String> {
-    coordinator.set_llm(&provider, &model)
+    coordinator.set_llm(&provider, &model)?;
+
+    // Fire-and-forget persist. We already swapped successfully — if the
+    // disk write fails the user's in-memory choice is still correct,
+    // they just lose it on next boot. Log so the failure is visible.
+    use tauri::Manager;
+    if let Ok(app_data_dir) = app.path().app_data_dir() {
+        let settings = crate::npc::settings_store::NpcSettings {
+            llm_provider: Some(provider.clone()),
+            llm_model: Some(model.clone()),
+        };
+        if let Err(e) = settings.save(&app_data_dir) {
+            eprintln!(
+                "[z-ro:npc] hot-swap OK but persist failed: {e}"
+            );
+        }
+    }
+    Ok(())
 }

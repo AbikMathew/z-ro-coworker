@@ -7,10 +7,11 @@ use tokio::sync::{watch, Mutex};
 use crate::task_engine::machine::TaskMachine;
 
 use super::conversation::{ConversationMemory, ConversationTurn};
+use super::interrupt::InterruptController;
 use super::llm_providers::{self, ApiKeys, ModelInfo};
 use super::overlay_driver::{self, AutoHideState};
 use super::screen_reader::ScreenReader;
-use super::voice::pipeline::{OverlayCommand, VoicePipeline};
+use super::voice::pipeline::{OverlayCommand, VoicePipeline, CANCELLED_ERR};
 
 // ── Voice result type ──────────────────────────────────────────────────
 
@@ -99,8 +100,12 @@ pub struct NpcCoordinator {
     /// show/hide the overlay window.
     app_handle: OnceLock<AppHandle>,
     /// Handle to the pending overlay auto-hide timer. Each new overlay
-    /// command batch cancels the prior timer so the 15 s countdown restarts.
+    /// command batch cancels the prior timer so the safety countdown restarts.
     auto_hide: AutoHideState,
+    /// Coordinator-wide cancellation primitive. `interrupt()` wakes any
+    /// turn currently blocked on an LLM/STT/TTS future; the pipeline then
+    /// returns `Err(CANCELLED_ERR)` which we translate back into Idle.
+    interrupt: InterruptController,
 }
 
 impl NpcCoordinator {
@@ -112,18 +117,20 @@ impl NpcCoordinator {
         pipeline: VoicePipeline,
         task_machine: Arc<std::sync::Mutex<TaskMachine>>,
         api_keys: Arc<ApiKeys>,
+        frame_buffer: crate::npc::frame_buffer::FrameBuffer,
     ) -> Self {
         let (state_tx, state_rx) = watch::channel(NpcState::Idle);
         Self {
             state_tx,
             state_rx,
-            screen_reader: Arc::new(ScreenReader::new()),
+            screen_reader: Arc::new(ScreenReader::new(frame_buffer)),
             conversation: Arc::new(Mutex::new(ConversationMemory::new(20))),
             pipeline: Arc::new(pipeline),
             task_machine,
             api_keys,
             app_handle: OnceLock::new(),
             auto_hide: overlay_driver::new_auto_hide_state(),
+            interrupt: InterruptController::new(),
         }
     }
 
@@ -228,7 +235,8 @@ impl NpcCoordinator {
             history = mem.recent(10).to_vec();
         }
 
-        // Process through pipeline
+        // Process through pipeline, armed with a cancellation handle.
+        let cancel = self.interrupt.new_turn();
         let result = self
             .pipeline
             .process_text_turn(
@@ -236,6 +244,7 @@ impl NpcCoordinator {
                 &screen,
                 task_state.as_ref(),
                 &history,
+                &cancel,
             )
             .await;
 
@@ -275,6 +284,13 @@ impl NpcCoordinator {
 
                 self.set_state(NpcState::Idle);
                 Ok(turn_result.assistant_text)
+            }
+            Err(e) if e == CANCELLED_ERR => {
+                // Barge-in: not a failure, just a user-requested early exit.
+                println!("[z-ro:npc] ask_text cancelled after {}ms", start.elapsed().as_millis());
+                self.clear_overlay_on_interrupt();
+                self.set_state(NpcState::Idle);
+                Err(CANCELLED_ERR.to_string())
             }
             Err(e) => {
                 eprintln!("[z-ro:npc] Pipeline error: {}", e);
@@ -365,7 +381,8 @@ impl NpcCoordinator {
             mem.recent(10).to_vec()
         };
 
-        // Run the full voice pipeline
+        // Run the full voice pipeline, armed with a cancel handle.
+        let cancel = self.interrupt.new_turn();
         let voice_result = self
             .pipeline
             .process_voice_turn(
@@ -374,6 +391,7 @@ impl NpcCoordinator {
                 &screen,
                 task_state.as_ref(),
                 &history,
+                &cancel,
             )
             .await;
 
@@ -430,6 +448,15 @@ impl NpcCoordinator {
                     audio_mime: vt.audio_mime,
                 })
             }
+            Err(e) if e == CANCELLED_ERR => {
+                println!(
+                    "[z-ro:npc] ask_voice cancelled after {}ms",
+                    start.elapsed().as_millis()
+                );
+                self.clear_overlay_on_interrupt();
+                self.set_state(NpcState::Idle);
+                Err(CANCELLED_ERR.to_string())
+            }
             Err(e) => {
                 eprintln!("[z-ro:npc] Voice pipeline error: {}", e);
                 self.set_state(NpcState::Error(e.clone()));
@@ -438,11 +465,43 @@ impl NpcCoordinator {
         }
     }
 
-    /// Interrupt the NPC.  Resets state to Idle — the frontend is
-    /// responsible for stopping any in-flight audio playback on its side.
+    /// Interrupt the NPC. Wakes any in-flight turn — the pipeline returns
+    /// `Err(CANCELLED_ERR)` which `ask_text`/`ask_voice` translate back to
+    /// `Idle`. Also clears the overlay immediately, and emits the
+    /// `npc-interrupt` event so the frontend can stop its audio element.
+    ///
+    /// Safe to call when no turn is running — `cancel()` just wakes zero
+    /// waiters.
     pub async fn interrupt(&self) -> Result<(), String> {
+        self.interrupt.cancel();
+        self.clear_overlay_on_interrupt();
+        if let Some(app) = self.app_handle.get() {
+            use tauri::Emitter;
+            let _ = app.emit("npc-interrupt", ());
+        }
         self.set_state(NpcState::Idle);
         Ok(())
+    }
+
+    /// Hide the overlay and cancel any pending auto-hide timer. Called
+    /// whenever a turn ends early so a stale arrow doesn't linger.
+    fn clear_overlay_on_interrupt(&self) {
+        let Some(app) = self.app_handle.get() else {
+            return;
+        };
+        // Build a single synthetic "clear" command and run it through the
+        // overlay driver so the same path handles timer cancellation and
+        // window hide.
+        let clear = OverlayCommand {
+            action: "clear".to_string(),
+            x: None,
+            y: None,
+            width: None,
+            height: None,
+            text: None,
+            color: None,
+        };
+        let _ = overlay_driver::apply(app, &[clear], &self.auto_hide);
     }
 
     /// Clear conversation history (new session).
@@ -528,7 +587,12 @@ mod tests {
         let tm = Arc::new(std::sync::Mutex::new(TaskMachine::new(PathBuf::from(
             "/nonexistent",
         ))));
-        NpcCoordinator::new(pipeline, tm, Arc::new(ApiKeys::default()))
+        NpcCoordinator::new(
+            pipeline,
+            tm,
+            Arc::new(ApiKeys::default()),
+            crate::npc::frame_buffer::FrameBuffer::new(),
+        )
     }
 
     #[test]

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { npc } from "$lib/npc/npcStore.svelte";
   import type { NpcStatus, ChatMessage } from "$lib/npc/types";
+  import { listen } from "@tauri-apps/api/event";
 
   // ── Local UI state ────────────────────────────────────────────────
   let messages: ChatMessage[] = $state([
@@ -25,13 +26,22 @@
   // Using a getter keeps the reactivity proxy alive across re-renders.
   const status = $derived<NpcStatus>(npc.status);
 
-  // Activate NPC once on mount
+  // Activate NPC once on mount + subscribe to the backend's barge-in event.
+  // When the user (or some other source) calls `npc_interrupt`, the backend
+  // cancels the in-flight turn AND emits `npc-interrupt` so the frontend
+  // can stop any HTML5 audio that's already playing client-side.
   $effect(() => {
     npc.activate().catch((e) => console.warn("[npc] Activate failed:", e));
+
+    const unlistenPromise = listen("npc-interrupt", () => {
+      stopPlayback();
+      isThinking = false;
+    });
+
     return () => {
-      // Stop any in-flight audio on unmount
       stopPlayback();
       stopRecordingSilently();
+      unlistenPromise.then((u) => u()).catch(() => {});
     };
   });
 
@@ -257,6 +267,23 @@
     e.preventDefault();
     stopRecording();
   }
+
+  /** Barge-in: cancels any in-flight turn (LLM stream, TTS synthesis, audio
+   *  playback) and returns the NPC to Idle. Wired to a small "Stop" button
+   *  that only appears while Zee is Thinking or Speaking. */
+  async function interrupt() {
+    try {
+      await npc.interrupt();
+    } catch (e) {
+      console.warn("[npc] interrupt failed:", e);
+    }
+    stopPlayback();
+    isThinking = false;
+  }
+
+  const isBusy = $derived(
+    status.state === "Thinking" || status.state === "Speaking" || isThinking,
+  );
 </script>
 
 <div class="bg-gray-900 rounded-2xl border border-gray-800 flex flex-col h-96">
@@ -356,16 +383,28 @@
       >
         {isRecording ? "● Rec" : "🎙"}
       </button>
-      <button
-        onclick={sendMessage}
-        disabled={isThinking || isRecording}
-        class="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm transition-colors"
-      >
-        Send
-      </button>
+      {#if isBusy}
+        <button
+          type="button"
+          onclick={interrupt}
+          aria-label="Stop Zee"
+          title="Interrupt — stop talking / cancel the turn"
+          class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg text-sm transition-colors"
+        >
+          Stop
+        </button>
+      {:else}
+        <button
+          onclick={sendMessage}
+          disabled={isThinking || isRecording}
+          class="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm transition-colors"
+        >
+          Send
+        </button>
+      {/if}
     </div>
     <p class="text-[11px] text-gray-500 mt-1.5">
-      Hold the mic button to speak · release to send
+      Hold the mic button to speak · release to send · click Stop to cut Zee off
     </p>
   </div>
 </div>

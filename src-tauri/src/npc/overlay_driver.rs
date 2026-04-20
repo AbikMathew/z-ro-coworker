@@ -17,11 +17,15 @@ use tokio::task::JoinHandle;
 use crate::commands::overlay::{OverlayData, OverlayElement};
 use crate::npc::voice::pipeline::OverlayCommand;
 
-/// How long an overlay stays on screen before auto-hiding.
-pub const AUTO_HIDE_SECS: u64 = 15;
+/// Safety-net TTL for an overlay. The overlay is meant to be cleared by
+/// explicit signals from the coordinator (LLM `{"action":"clear"}`, validator
+/// confirming a step, or the user acting on the pointed target — added in
+/// Phase 3). This 60s fallback only kicks in when none of those ever fire,
+/// so a stale arrow can't pin itself to the screen forever.
+pub const AUTO_HIDE_SECS: u64 = 60;
 
-/// Shared handle to the pending auto-hide timer. Each new overlay cancels the
-/// prior pending timer so a fresh 15s countdown begins.
+/// Shared handle to the pending safety-net timer. Each new overlay cancels
+/// the prior pending timer so the countdown restarts on every update.
 pub type AutoHideState = Arc<Mutex<Option<JoinHandle<()>>>>;
 
 pub fn new_auto_hide_state() -> AutoHideState {

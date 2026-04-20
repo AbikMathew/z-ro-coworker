@@ -25,6 +25,13 @@
         "text": "Open Finder from your dock",
         "position": "center"
       },
+      "milestones": [
+        {
+          "id": "finder_focused",
+          "goal_text": "Finder is the focused app",
+          "verification": {"kind": "process_name_equals", "value": "Finder"}
+        }
+      ],
       "xp": 5
     },
     {
@@ -44,6 +51,18 @@
         "text": "Click 'Documents' in the sidebar",
         "position": "left"
       },
+      "milestones": [
+        {
+          "id": "finder_still_focused",
+          "goal_text": "User is still in Finder",
+          "verification": {"kind": "process_name_equals", "value": "Finder"}
+        },
+        {
+          "id": "documents_window",
+          "goal_text": "The Finder window title mentions Documents",
+          "verification": {"kind": "window_title_contains", "value": "Documents"}
+        }
+      ],
       "xp": 5
     },
     {

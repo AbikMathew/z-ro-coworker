@@ -5,12 +5,18 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use crate::npc::conversation::ConversationTurn;
+use crate::npc::interrupt::InterruptHandle;
 use crate::npc::prompt_builder::{LlmMessage, PromptBuilder};
 use crate::npc::screen_reader::ScreenContext;
 use crate::task_engine::types::TaskState;
 
 use super::stt::SttProvider;
 use super::tts::TtsProvider;
+
+/// Sentinel error returned by pipeline methods when the turn was cancelled
+/// mid-flight via `InterruptController::cancel()`. Callers should treat
+/// this as a normal outcome, not a failure — the user asked us to stop.
+pub const CANCELLED_ERR: &str = "cancelled";
 
 // ── LLM Provider trait ─────────────────────────────────────────────────
 
@@ -156,6 +162,7 @@ impl VoicePipeline {
         screen: &ScreenContext,
         task: Option<&TaskState>,
         history: &[ConversationTurn],
+        cancel: &InterruptHandle,
     ) -> Result<TurnResult, String> {
         // Build prompt
         let (system, messages) = self.prompt_builder.build(screen, task, history, text);
@@ -179,11 +186,34 @@ impl VoicePipeline {
             history.len(),
         );
 
-        // Stream LLM response
+        // Race the LLM stream against the cancel signal. Arming the future
+        // before the first chunk means a cancel fired during the first HTTP
+        // round-trip still wakes us.
+        let cancelled = cancel.cancelled();
+        tokio::pin!(cancelled);
+
         let mut rx = llm.stream_chat(&system, &messages).await?;
         let mut full_response = String::new();
-        while let Some(chunk) = rx.recv().await {
-            full_response.push_str(&chunk);
+        loop {
+            tokio::select! {
+                biased;
+                // biased: check cancellation first so a pile of buffered
+                // chunks can't starve the cancel signal.
+                () = &mut cancelled => {
+                    // Dropping `rx` closes the channel; the provider's send
+                    // task will see `SendError` on its next tx.send and
+                    // abort the upstream HTTP stream.
+                    drop(rx);
+                    println!("[z-ro:npc] llm stream cancelled mid-turn");
+                    return Err(CANCELLED_ERR.to_string());
+                }
+                chunk = rx.recv() => {
+                    match chunk {
+                        Some(c) => full_response.push_str(&c),
+                        None => break,
+                    }
+                }
+            }
         }
 
         // Parse overlay commands from the response
@@ -231,28 +261,54 @@ impl VoicePipeline {
         screen: &ScreenContext,
         task: Option<&TaskState>,
         history: &[ConversationTurn],
+        cancel: &InterruptHandle,
     ) -> Result<VoiceTurnResult, String> {
         let stt = self
             .stt
             .as_ref()
             .ok_or_else(|| "STT provider not configured".to_string())?;
 
-        // 1. Transcribe
-        let transcript = stt.transcribe(audio_bytes, audio_filename).await?;
+        // 1. Transcribe. STT providers are single-shot HTTP, so a cancel
+        // just means "drop the future" — reqwest aborts the connection.
+        let transcript = {
+            let cancelled = cancel.cancelled();
+            tokio::pin!(cancelled);
+            tokio::select! {
+                biased;
+                () = &mut cancelled => {
+                    println!("[z-ro:npc] STT cancelled before transcript");
+                    return Err(CANCELLED_ERR.to_string());
+                }
+                result = stt.transcribe(audio_bytes, audio_filename) => result?,
+            }
+        };
         if transcript.trim().is_empty() {
             return Err("STT returned empty transcript (silence?)".to_string());
         }
 
-        // 2. LLM turn (reuses text-turn logic)
+        // 2. LLM turn (reuses text-turn logic — cancel threads through).
         let turn = self
-            .process_text_turn(&transcript, screen, task, history)
+            .process_text_turn(&transcript, screen, task, history, cancel)
             .await?;
 
-        // 3. TTS — synthesize the displayed (overlay-stripped) text
+        // 3. TTS — synthesize the displayed (overlay-stripped) text. Race
+        // again so a cancel during synthesis doesn't burn TTS credits for
+        // audio the user will never hear.
         let (audio_mime, audio_bytes) = match &self.tts {
             Some(tts) if !turn.assistant_text.trim().is_empty() => {
-                let synth = tts.synthesize(&turn.assistant_text).await?;
-                (synth.mime, synth.bytes)
+                let cancelled = cancel.cancelled();
+                tokio::pin!(cancelled);
+                tokio::select! {
+                    biased;
+                    () = &mut cancelled => {
+                        println!("[z-ro:npc] TTS cancelled mid-synthesis");
+                        return Err(CANCELLED_ERR.to_string());
+                    }
+                    synth = tts.synthesize(&turn.assistant_text) => {
+                        let synth = synth?;
+                        (synth.mime, synth.bytes)
+                    }
+                }
             }
             _ => (String::new(), Vec::new()),
         };
@@ -503,6 +559,41 @@ Done."#;
         }
     }
 
+    /// Mock that yields one chunk every `delay` and never completes on its
+    /// own — useful for exercising the cancel path without racing a fast
+    /// normal completion.
+    struct SlowMockLlm {
+        chunk_delay: std::time::Duration,
+    }
+
+    #[async_trait]
+    impl LlmProvider for SlowMockLlm {
+        async fn stream_chat(
+            &self,
+            _system: &str,
+            _messages: &[LlmMessage],
+        ) -> Result<mpsc::Receiver<String>, String> {
+            let (tx, rx) = mpsc::channel(16);
+            let delay = self.chunk_delay;
+            tokio::spawn(async move {
+                let mut i = 0u32;
+                loop {
+                    tokio::time::sleep(delay).await;
+                    if tx.send(format!("chunk-{i} ")).await.is_err() {
+                        // Receiver dropped (likely a cancel) — stop trying.
+                        return;
+                    }
+                    i += 1;
+                }
+            });
+            Ok(rx)
+        }
+
+        fn name(&self) -> &str {
+            "slow-mock-llm"
+        }
+    }
+
     fn make_screen() -> ScreenContext {
         ScreenContext {
             window: WindowInfo {
@@ -518,6 +609,36 @@ Done."#;
     }
 
     #[tokio::test]
+    async fn test_pipeline_cancel_mid_stream_returns_cancelled_err() {
+        use crate::npc::interrupt::InterruptController;
+        use std::time::Duration;
+
+        let llm = SlowMockLlm {
+            chunk_delay: Duration::from_millis(30),
+        };
+        let pipeline = Arc::new(VoicePipeline::new(None, None, Arc::new(llm)));
+        let screen = make_screen();
+        let ctrl = Arc::new(InterruptController::new());
+        let cancel = ctrl.new_turn();
+
+        // Fire the cancel 80ms in — long enough for the stream to deliver
+        // one or two chunks, short enough that the test finishes fast.
+        let ctrl_for_canceler = ctrl.clone();
+        let canceler = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            ctrl_for_canceler.cancel();
+        });
+
+        let err = pipeline
+            .process_text_turn("tell me a story", &screen, None, &[], &cancel)
+            .await
+            .expect_err("should be cancelled, not Ok");
+        assert_eq!(err, CANCELLED_ERR);
+
+        canceler.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_pipeline_text_turn_basic() {
         let llm = MockLlm {
             response: "I can see you have VS Code open with main.rs!".to_string(),
@@ -526,7 +647,7 @@ Done."#;
         let screen = make_screen();
 
         let result = pipeline
-            .process_text_turn("What do you see?", &screen, None, &[])
+            .process_text_turn("What do you see?", &screen, None, &[], &InterruptHandle::never_cancels())
             .await
             .unwrap();
 
@@ -549,7 +670,7 @@ That should work!"#;
         let screen = make_screen();
 
         let result = pipeline
-            .process_text_turn("How do I save?", &screen, None, &[])
+            .process_text_turn("How do I save?", &screen, None, &[], &InterruptHandle::never_cancels())
             .await
             .unwrap();
 
@@ -589,7 +710,7 @@ That should work!"#;
         ];
 
         let result = pipeline
-            .process_text_turn("Where were we?", &screen, None, &history)
+            .process_text_turn("Where were we?", &screen, None, &history, &InterruptHandle::never_cancels())
             .await
             .unwrap();
 
@@ -675,7 +796,7 @@ That should work!"#;
 
         let screen = make_screen();
         let result = pipeline
-            .process_voice_turn(b"audio-bytes", "audio.webm", &screen, None, &[])
+            .process_voice_turn(b"audio-bytes", "audio.webm", &screen, None, &[], &InterruptHandle::never_cancels())
             .await
             .unwrap();
 
@@ -694,7 +815,7 @@ That should work!"#;
         );
         let screen = make_screen();
         let err = pipeline
-            .process_voice_turn(b"x", "audio.webm", &screen, None, &[])
+            .process_voice_turn(b"x", "audio.webm", &screen, None, &[], &InterruptHandle::never_cancels())
             .await
             .unwrap_err();
         assert!(err.contains("STT"));
@@ -712,7 +833,7 @@ That should work!"#;
         );
         let screen = make_screen();
         let err = pipeline
-            .process_voice_turn(b"silent", "audio.webm", &screen, None, &[])
+            .process_voice_turn(b"silent", "audio.webm", &screen, None, &[], &InterruptHandle::never_cancels())
             .await
             .unwrap_err();
         assert!(err.to_lowercase().contains("empty") || err.to_lowercase().contains("silence"));
@@ -730,7 +851,7 @@ That should work!"#;
         );
         let screen = make_screen();
         let result = pipeline
-            .process_voice_turn(b"x", "audio.webm", &screen, None, &[])
+            .process_voice_turn(b"x", "audio.webm", &screen, None, &[], &InterruptHandle::never_cancels())
             .await
             .unwrap();
         assert!(result.turn.assistant_text.contains("Hi"));

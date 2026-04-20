@@ -219,7 +219,7 @@
         {@const anchor = labelAnchor(tipX, tipY)}
         <div
           class="absolute overlay-pop"
-          style="left: {anchor.x}px; top: {anchor.y}px;"
+          style="left: {anchor.x}px; top: {anchor.y}px; pointer-events: none;"
         >
           <div
             class="flex items-center gap-2 px-3 py-2 rounded-xl shadow-lg backdrop-blur-md"
@@ -241,7 +241,7 @@
         {@const ty = ny(el.y)}
         <div
           class="absolute overlay-pop max-w-xs"
-          style="left: {tx}px; top: {ty}px;"
+          style="left: {tx}px; top: {ty}px; pointer-events: none;"
         >
           <div
             class="px-4 py-2 rounded-xl shadow-lg backdrop-blur-md"
@@ -264,7 +264,10 @@
   {/key}
 
   {#if elements.length === 0}
-    <p class="text-white text-xs opacity-20 absolute bottom-4 right-4">
+    <p
+      class="text-white text-xs opacity-20 absolute bottom-4 right-4"
+      style="pointer-events: none;"
+    >
       Z-RO Overlay
     </p>
   {/if}
