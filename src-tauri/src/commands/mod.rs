@@ -5,3 +5,4 @@ pub mod ai;
 pub mod env;
 pub mod npc;
 pub mod capture;
+pub mod events;

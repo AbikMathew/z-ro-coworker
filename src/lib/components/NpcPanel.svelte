@@ -2,6 +2,7 @@
   import { npc } from "$lib/npc/npcStore.svelte";
   import type { NpcStatus, ChatMessage } from "$lib/npc/types";
   import { listen } from "@tauri-apps/api/event";
+  import EventsBadge from "$lib/components/EventsBadge.svelte";
 
   // ── Local UI state ────────────────────────────────────────────────
   let messages: ChatMessage[] = $state([
@@ -22,6 +23,20 @@
   let micError: string | null = $state(null);
   let currentAudio: HTMLAudioElement | null = null;
 
+  // Reactive milestone progress: which milestone the Verifier last signalled
+  // on, and whether it's confirmed. Keyed by milestone_id so repeated events
+  // (every click fires this) don't pile up — the latest state wins.
+  interface MilestoneProgress {
+    task_id: string;
+    step_id: string;
+    milestone_id: string;
+    state: "confirmed" | "not_yet" | "undecided";
+    index: number;
+    total: number;
+  }
+  let milestoneProgress: Record<string, MilestoneProgress> = $state({});
+  let lastProgressAt = $state(0);
+
   // Derived: track the store's reactive status directly (no subscribe()).
   // Using a getter keeps the reactivity proxy alive across re-renders.
   const status = $derived<NpcStatus>(npc.status);
@@ -33,17 +48,53 @@
   $effect(() => {
     npc.activate().catch((e) => console.warn("[npc] Activate failed:", e));
 
-    const unlistenPromise = listen("npc-interrupt", () => {
+    const unlistenInterrupt = listen("npc-interrupt", () => {
       stopPlayback();
       isThinking = false;
+    });
+
+    // Reactive loop signal — Phase 3d. The backend runs the Verifier
+    // against the active step's milestones on every click/keypress and
+    // pushes the outcome here. We key by milestone_id so a fast typist
+    // can't overflow the state object.
+    const unlistenProgress = listen<MilestoneProgress>(
+      "milestone-progress",
+      (event) => {
+        const p = event.payload;
+        milestoneProgress[p.milestone_id] = p;
+        lastProgressAt = Date.now();
+      },
+    );
+
+    // Task advancement — when the Verifier confirms every milestone the
+    // backend advances the step and emits this. Log so it's visible in
+    // the console while the full UI catches up.
+    const unlistenTaskState = listen("task-state-update", (event) => {
+      console.log("[npc] task advanced:", event.payload);
+      // Reset the progress cache for the new step.
+      milestoneProgress = {};
     });
 
     return () => {
       stopPlayback();
       stopRecordingSilently();
-      unlistenPromise.then((u) => u()).catch(() => {});
+      unlistenInterrupt.then((u) => u()).catch(() => {});
+      unlistenProgress.then((u) => u()).catch(() => {});
+      unlistenTaskState.then((u) => u()).catch(() => {});
     };
   });
+
+  // The milestone strip only shows when milestones were reported for the
+  // current step. It fades away if nothing happens for 60 seconds so the
+  // chat isn't cluttered when the feature is inactive.
+  const showMilestones = $derived.by(() => {
+    const items = Object.values(milestoneProgress);
+    if (items.length === 0) return false;
+    return Date.now() - lastProgressAt < 60_000;
+  });
+  const milestonesSorted = $derived.by(() =>
+    Object.values(milestoneProgress).sort((a, b) => a.index - b.index),
+  );
 
   // ── Helpers ───────────────────────────────────────────────────────
   function stateLabel(state: NpcStatus["state"]): string {
@@ -294,18 +345,38 @@
     >
       Z
     </div>
-    <div class="flex-1">
+    <div class="flex-1 min-w-0">
       <p class="font-medium text-sm">Zee</p>
-      <p class="text-gray-500 text-xs">
+      <p class="text-gray-500 text-xs truncate">
         {status.model_name} &middot; {status.conversation_turns} turns
       </p>
     </div>
+    <EventsBadge />
     <!-- Status indicator -->
     <div class="flex items-center gap-1.5">
       <div class="w-2 h-2 rounded-full {stateColor(status.state)}"></div>
       <span class="text-xs text-gray-400">{stateLabel(status.state)}</span>
     </div>
   </div>
+
+  <!-- Milestone progress strip (Phase 3d). Surfaces the reactive loop
+       verdict without needing the user to ask "am I done with this step?". -->
+  {#if showMilestones}
+    <div class="px-4 py-2 border-b border-gray-800 bg-gray-800/40 flex gap-1.5 flex-wrap">
+      {#each milestonesSorted as m (m.milestone_id)}
+        <span
+          class="milestone-pill"
+          class:confirmed={m.state === "confirmed"}
+          class:not-yet={m.state === "not_yet"}
+          class:undecided={m.state === "undecided"}
+          title="milestone {m.index + 1}/{m.total} ({m.state}) on step {m.step_id}"
+        >
+          {m.state === "confirmed" ? "✓" : m.state === "undecided" ? "?" : "…"}
+          <span class="id">{m.milestone_id}</span>
+        </span>
+      {/each}
+    </div>
+  {/if}
 
   <!-- Context bar: what Zee can see -->
   {#if status.active_task || status.current_step}
@@ -408,3 +479,38 @@
     </p>
   </div>
 </div>
+
+<style>
+  .milestone-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 8px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 500;
+    background: rgba(30, 41, 59, 0.8);
+    border: 1px solid rgba(100, 116, 139, 0.4);
+    color: rgba(203, 213, 225, 0.85);
+  }
+  .milestone-pill.confirmed {
+    background: rgba(16, 185, 129, 0.15);
+    border-color: rgba(34, 197, 94, 0.55);
+    color: #a7f3d0;
+  }
+  .milestone-pill.not-yet {
+    background: rgba(234, 179, 8, 0.1);
+    border-color: rgba(234, 179, 8, 0.45);
+    color: #fde68a;
+  }
+  .milestone-pill.undecided {
+    background: rgba(148, 163, 184, 0.12);
+    border-color: rgba(148, 163, 184, 0.35);
+    color: #cbd5e1;
+  }
+  .milestone-pill .id {
+    opacity: 0.75;
+    font-family: ui-monospace, SFMono-Regular, monospace;
+    font-size: 10px;
+  }
+</style>

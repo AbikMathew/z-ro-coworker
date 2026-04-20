@@ -35,9 +35,16 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 # `macos_14_0` feature unlocks SCContentSharingPicker (the native "which window?"
 # dialog that Zoom/Meet use). Apple gates the picker at macOS 14 Sonoma and has
 # penalised alternative paths since Sequoia, so this is the supported way in.
+#
+# `rdev` provides the global mouse / key event listener for Phase 3b. It spins
+# its own CFRunLoop on a dedicated thread and requires Accessibility permission
+# (System Settings → Privacy & Security → Accessibility). Event delivery is
+# silently dropped if permission is missing — the listener surface handles
+# that with a runtime probe.
 [target.'cfg(target_os = "macos")'.dependencies]
 accessibility = "0.1"
 accessibility-sys = "0.1"
 core-foundation = "0.9"
 screencapturekit = { version = "1.5.4", features = ["macos_14_0", "async"] }
+rdev = "0.5.3"
 

@@ -60,6 +60,13 @@ pub fn run() {
     let frame_buffer = npc::frame_buffer::FrameBuffer::new();
     let capture_state = commands::capture::CaptureState::new(frame_buffer.clone());
 
+    // Global OS event listener (macOS only in v1). Wired up before the
+    // coordinator so the coordinator can subscribe at construction time.
+    // Listener thread is spawned in `setup()` once the app is fully alive —
+    // starting here would run it before Tauri's event loop exists.
+    #[cfg(target_os = "macos")]
+    let event_bus = npc::events::EventBus::new(256);
+
     // ── NPC Coordinator setup ──────────────────────────────────────
     //
     // Provider selection precedence:
@@ -135,15 +142,19 @@ pub fn run() {
         default_provider, default_model
     );
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(task_machine)
         .manage(Mutex::new(AiBridge::new(api_keys.openai.clone())))
         .manage(api_keys.clone())
         .manage(Arc::new(npc_coordinator))
         .manage(capture_state)
-        .manage(frame_buffer.clone())
-        .setup(|app| {
+        .manage(frame_buffer.clone());
+    #[cfg(target_os = "macos")]
+    let builder = builder.manage(event_bus.clone());
+
+    builder
+        .setup(move |app| {
             use tauri::Manager;
             // Create the overlay window on startup (hidden by default)
             let handle = app.handle().clone();
@@ -159,6 +170,21 @@ pub fn run() {
             let coord = app.state::<Arc<npc::NpcCoordinator>>();
             coord.set_app_handle(handle.clone());
             println!("[z-ro:npc] AppHandle installed on coordinator");
+
+            // Start the global OS event listener. Fails silently if
+            // Accessibility permission isn't granted — the frontend
+            // polls `events_status` to surface a nudge in that case.
+            #[cfg(target_os = "macos")]
+            {
+                if let Err(e) = event_bus.start() {
+                    eprintln!("[z-ro:events] listener failed to start: {e}");
+                } else {
+                    println!("[z-ro:events] listener armed");
+                }
+                // Coordinator subscribes here so each turn can watch for
+                // user actions against the active step's milestones.
+                coord.attach_event_bus(event_bus.clone());
+            }
 
             // Restore the user's last-saved LLM choice from disk. First
             // boot: the file is absent, default stays.
@@ -217,6 +243,7 @@ pub fn run() {
             commands::capture::capture_request_picker,
             commands::capture::capture_stop,
             commands::capture::capture_status,
+            commands::events::events_status,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

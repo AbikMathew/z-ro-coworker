@@ -108,6 +108,21 @@ pub struct NpcCoordinator {
     interrupt: InterruptController,
 }
 
+/// Payload emitted to the frontend whenever the Verifier decides something
+/// about the user's progress through the current step's milestones.
+#[derive(Debug, Clone, Serialize)]
+pub struct MilestoneProgress {
+    pub task_id: String,
+    pub step_id: String,
+    pub milestone_id: String,
+    /// `"confirmed"` | `"not_yet"` | `"undecided"`.
+    pub state: &'static str,
+    /// 0-based index of the milestone that was evaluated.
+    pub index: usize,
+    /// Total number of milestones on this step.
+    pub total: usize,
+}
+
 impl NpcCoordinator {
     /// Create a new coordinator.
     ///
@@ -481,6 +496,166 @@ impl NpcCoordinator {
         }
         self.set_state(NpcState::Idle);
         Ok(())
+    }
+
+    /// Subscribe to the global event listener and spawn a background
+    /// watcher that runs the Verifier against the active step's milestones
+    /// whenever the user clicks or types. This is the piece that gives
+    /// z-ro its "Zee keeps watching" behaviour — guidance advances without
+    /// the user having to ask a new question.
+    ///
+    /// Spawns one long-lived tokio task per coordinator. The task holds a
+    /// `Weak<NpcCoordinator>` equivalent via the shared `Arc` that backs
+    /// Tauri's managed state; since the coordinator lives the whole app
+    /// lifetime, we can keep a strong `Arc` clone and let the task tear
+    /// down on process exit.
+    #[cfg(target_os = "macos")]
+    pub fn attach_event_bus(self: &Arc<Self>, bus: crate::npc::events::EventBus) {
+        let coord = self.clone();
+        let mut rx = bus.subscribe();
+        tokio::spawn(async move {
+            println!("[z-ro:npc] event watcher spawned");
+            loop {
+                match rx.recv().await {
+                    Ok(event) => coord.handle_user_event(event).await,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        // Fast typist overflowed the channel. Shouldn't
+                        // happen with a 256-slot buffer but log if it does.
+                        eprintln!("[z-ro:npc] event watcher lagged by {n} — dropped");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        println!("[z-ro:npc] event bus closed — watcher exiting");
+                        return;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Handle one OS event. Fast path: no active task, no task milestones,
+    /// or NPC is mid-turn — bail early so the user's existing Ask flow
+    /// isn't disrupted.
+    #[cfg(target_os = "macos")]
+    async fn handle_user_event(&self, event: crate::npc::events::NpcEvent) {
+        // Guard 1: if the NPC is currently processing a turn, let that
+        // turn finish first — running the Verifier concurrently would
+        // race on state.
+        if !matches!(*self.state_rx.borrow(), NpcState::Idle) {
+            return;
+        }
+
+        // Guard 2: need an active task with milestones on the current step.
+        let task_state = match self.task_machine.lock() {
+            Ok(m) => m.get_state(),
+            Err(_) => return,
+        };
+        let Some(task_state) = task_state else {
+            return;
+        };
+        let milestones = &task_state.current_step.milestones;
+        if milestones.is_empty() {
+            return;
+        }
+
+        // Capture fresh screen context to feed the Verifier. Cheap — AX
+        // tree read + latest frame from the ring.
+        let Ok(screen) = self.screen_reader.capture() else {
+            return;
+        };
+
+        // Use the standalone Verifier primitive (Phase 3c) to evaluate.
+        let verifier = crate::npc::verifier::Verifier::new(
+            self.screen_reader_frame_buffer_for_verifier(),
+        );
+        let unsatisfied = verifier.first_unsatisfied(milestones, &screen);
+
+        let event_kind = match &event {
+            crate::npc::events::NpcEvent::Click { .. } => "click",
+            crate::npc::events::NpcEvent::KeyPress { .. } => "key",
+        };
+
+        match unsatisfied {
+            None => {
+                // Every milestone passes — advance the step.
+                println!(
+                    "[z-ro:npc] reactive: {event_kind} → all {} milestones confirmed on step '{}', advancing",
+                    milestones.len(),
+                    task_state.current_step.id
+                );
+                // Emit progress for each milestone before advancing so the
+                // UI can show the final state of the finishing step.
+                if let Some(app) = self.app_handle.get() {
+                    use tauri::Emitter;
+                    let total = milestones.len();
+                    for (i, m) in milestones.iter().enumerate() {
+                        let _ = app.emit(
+                            "milestone-progress",
+                            &MilestoneProgress {
+                                task_id: task_state.task_id.clone(),
+                                step_id: task_state.current_step.id.clone(),
+                                milestone_id: m.id.clone(),
+                                state: "confirmed",
+                                index: i,
+                                total,
+                            },
+                        );
+                    }
+                }
+
+                // Advance the state machine. If this lifts to "Completed",
+                // the next user event is a no-op (guard 2 above).
+                let next = self
+                    .task_machine
+                    .lock()
+                    .ok()
+                    .and_then(|mut m| m.advance_step().ok());
+                if let Some(next_state) = next {
+                    if let Some(app) = self.app_handle.get() {
+                        use tauri::Emitter;
+                        let _ = app.emit("task-state-update", &next_state);
+                    }
+                    println!(
+                        "[z-ro:npc] reactive: advanced to step {}/{} ({})",
+                        next_state.current_step_index + 1,
+                        next_state.total_steps,
+                        next_state.current_step.id
+                    );
+                }
+            }
+            Some((i, m, result)) => {
+                // Milestone i is not yet confirmed. Emit progress so the
+                // UI can show "waiting on X" without spamming on every
+                // keypress — frontend should dedupe by (step_id, milestone_id).
+                if let Some(app) = self.app_handle.get() {
+                    use tauri::Emitter;
+                    let state = match result {
+                        crate::npc::verifier::VerifyResult::NotYet => "not_yet",
+                        crate::npc::verifier::VerifyResult::Undecided => "undecided",
+                        crate::npc::verifier::VerifyResult::Confirmed => "confirmed",
+                    };
+                    let _ = app.emit(
+                        "milestone-progress",
+                        &MilestoneProgress {
+                            task_id: task_state.task_id.clone(),
+                            step_id: task_state.current_step.id.clone(),
+                            milestone_id: m.id.clone(),
+                            state,
+                            index: i,
+                            total: milestones.len(),
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Helper for the Verifier: reconstitutes a FrameBuffer handle from
+    /// the screen reader's private buffer. The Verifier only uses the
+    /// handle for potential LlmJudge calls (currently stubbed) so this is
+    /// OK to stub as an empty buffer — revisit when LlmJudge is wired.
+    #[cfg(target_os = "macos")]
+    fn screen_reader_frame_buffer_for_verifier(&self) -> crate::npc::frame_buffer::FrameBuffer {
+        crate::npc::frame_buffer::FrameBuffer::new()
     }
 
     /// Hide the overlay and cancel any pending auto-hide timer. Called

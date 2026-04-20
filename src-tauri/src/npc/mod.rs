@@ -11,5 +11,7 @@ pub mod frame_buffer;
 pub mod interrupt;
 pub mod verifier;
 pub mod settings_store;
+#[cfg(target_os = "macos")]
+pub mod events;
 
 pub use coordinator::NpcCoordinator;
