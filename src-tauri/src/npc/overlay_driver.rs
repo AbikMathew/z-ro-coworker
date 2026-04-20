@@ -17,12 +17,17 @@ use tokio::task::JoinHandle;
 use crate::commands::overlay::{OverlayData, OverlayElement};
 use crate::npc::voice::pipeline::OverlayCommand;
 
-/// Safety-net TTL for an overlay. The overlay is meant to be cleared by
-/// explicit signals from the coordinator (LLM `{"action":"clear"}`, validator
-/// confirming a step, or the user acting on the pointed target — added in
-/// Phase 3). This 60s fallback only kicks in when none of those ever fire,
-/// so a stale arrow can't pin itself to the screen forever.
-pub const AUTO_HIDE_SECS: u64 = 60;
+/// Safety-net TTL for an overlay. The primary lifecycle is event-driven —
+/// the overlay clears when the LLM emits `{"action":"clear"}`, when the
+/// Verifier advances a step, or when the coordinator's event watcher sees
+/// a mouse click (Phase 3d). 15 s is the failsafe for all three missing.
+///
+/// Was 60 s until April 2026; dropped to 15 s because in practice arrows
+/// became stale fast — users click somewhere, decide the arrow was
+/// pointing at the wrong thing, and a lingering pointer adds noise. Each
+/// new overlay command batch cancels the prior timer so a fresh arrow
+/// restarts the countdown.
+pub const AUTO_HIDE_SECS: u64 = 15;
 
 /// Shared handle to the pending safety-net timer. Each new overlay cancels
 /// the prior pending timer so the countdown restarts on every update.

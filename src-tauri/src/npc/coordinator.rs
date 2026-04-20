@@ -639,8 +639,20 @@ impl NpcCoordinator {
     /// Handle one OS event. Fast path: no active task, no task milestones,
     /// or NPC is mid-turn — bail early so the user's existing Ask flow
     /// isn't disrupted.
+    ///
+    /// Side effect for clicks: any existing overlay is cleared immediately.
+    /// When the user mouse-clicks somewhere, the arrow Zee drew earlier is
+    /// almost certainly stale (the user either just followed it, ignored
+    /// it, or moved on). Clearing on-click gives a much tighter UX than
+    /// waiting for the 15 s safety timer to fire. Key presses do NOT
+    /// clear — the user is likely typing what the arrow told them to.
     #[cfg(target_os = "macos")]
     async fn handle_user_event(&self, event: crate::npc::events::NpcEvent) {
+        // Clear overlay on click, regardless of task state.
+        if matches!(event, crate::npc::events::NpcEvent::Click { .. }) {
+            self.clear_overlay_on_interrupt();
+        }
+
         // Guard 1: if the NPC is currently processing a turn, let that
         // turn finish first — running the Verifier concurrently would
         // race on state.
