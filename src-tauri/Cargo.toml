@@ -45,6 +45,6 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 accessibility = "0.1"
 accessibility-sys = "0.1"
 core-foundation = "0.9"
+core-graphics = "0.23"
 screencapturekit = { version = "1.5.4", features = ["macos_14_0", "async"] }
-rdev = "0.5.3"
 
