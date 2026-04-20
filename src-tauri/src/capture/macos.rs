@@ -22,7 +22,6 @@
 //! - `CaptureSession` holds the `SCStream`. Dropping the session stops capture
 //!   (via `stop_capture()` in `Drop`).
 
-use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;

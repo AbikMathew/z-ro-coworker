@@ -504,16 +504,17 @@ impl NpcCoordinator {
     /// z-ro its "Zee keeps watching" behaviour — guidance advances without
     /// the user having to ask a new question.
     ///
-    /// Spawns one long-lived tokio task per coordinator. The task holds a
-    /// `Weak<NpcCoordinator>` equivalent via the shared `Arc` that backs
-    /// Tauri's managed state; since the coordinator lives the whole app
-    /// lifetime, we can keep a strong `Arc` clone and let the task tear
-    /// down on process exit.
+    /// We use `tauri::async_runtime::spawn` rather than `tokio::spawn` so
+    /// this is safe to call from `tauri::Builder::setup()` — at that point
+    /// Tauri has initialised its own runtime but `#[tokio::main]`-style
+    /// reactor attachment hasn't happened yet, and `tokio::spawn` panics
+    /// with "there is no reactor running". Tauri's async_runtime is a thin
+    /// shim that resolves to tokio at runtime.
     #[cfg(target_os = "macos")]
     pub fn attach_event_bus(self: &Arc<Self>, bus: crate::npc::events::EventBus) {
         let coord = self.clone();
         let mut rx = bus.subscribe();
-        tokio::spawn(async move {
+        tauri::async_runtime::spawn(async move {
             println!("[z-ro:npc] event watcher spawned");
             loop {
                 match rx.recv().await {
