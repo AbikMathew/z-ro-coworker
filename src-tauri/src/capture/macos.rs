@@ -76,6 +76,21 @@ pub struct PickerResult {
     pub width: u32,
     pub height: u32,
     pub source_kind: &'static str,
+    /// Bounds of the captured region on the user's screen(s), in **logical
+    /// points** (matches what `app.primary_monitor().size() / scale_factor`
+    /// returns). Consumed by the overlay driver to translate LLM coords
+    /// from capture-local to monitor-local space.
+    pub bounds: CaptureBounds,
+}
+
+/// Captured region's position + size on-screen, in logical points. `origin`
+/// is top-left in the global screen coord system.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+pub struct CaptureBounds {
+    pub origin_x: f64,
+    pub origin_y: f64,
+    pub width: f64,
+    pub height: f64,
 }
 
 /// Live SCK capture session. Drop to stop the stream; the `Drop` impl calls
@@ -83,6 +98,9 @@ pub struct PickerResult {
 pub struct CaptureSession {
     stream: SCStream,
     buffer: FrameBuffer,
+    /// Screen bounds of the captured region, used by the overlay driver
+    /// to translate LLM coords from capture-local to monitor-local.
+    pub bounds: CaptureBounds,
 }
 
 impl CaptureSession {
@@ -124,6 +142,13 @@ pub async fn request_picker_and_start(
     };
 
     let (src_w, src_h) = result.pixel_size();
+    let (rect_x, rect_y, rect_w, rect_h) = result.rect();
+    let bounds = CaptureBounds {
+        origin_x: rect_x,
+        origin_y: rect_y,
+        width: rect_w,
+        height: rect_h,
+    };
     let source_kind = if !result.windows().is_empty() {
         "window"
     } else if !result.displays().is_empty() {
@@ -151,15 +176,17 @@ pub async fn request_picker_and_start(
 
     println!(
         "[z-ro:capture] stream started: source={source_kind} native={src_w}x{src_h} \
-         captured@{CAPTURE_WIDTH}x{CAPTURE_HEIGHT}"
+         captured@{CAPTURE_WIDTH}x{CAPTURE_HEIGHT} \
+         bounds=({rect_x:.0},{rect_y:.0}) {rect_w:.0}x{rect_h:.0}pt"
     );
 
     Ok((
-        CaptureSession { stream, buffer },
+        CaptureSession { stream, buffer, bounds },
         PickerResult {
             width: CAPTURE_WIDTH,
             height: CAPTURE_HEIGHT,
             source_kind,
+            bounds,
         },
     ))
 }

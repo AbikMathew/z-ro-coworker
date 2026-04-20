@@ -161,6 +161,13 @@ impl NpcCoordinator {
     /// Internal: dispatch a batch of overlay commands if the AppHandle is
     /// installed. Logs and swallows errors — overlay failures must never
     /// break a turn.
+    ///
+    /// Before passing commands to the overlay driver, we translate LLM
+    /// coordinates from capture-local `[0,1]` to monitor-local `[0,1]`.
+    /// The LLM sees only the captured region (e.g. a single window) but
+    /// the overlay window covers the whole primary monitor, so a coord
+    /// like `(0.5, 0.5)` — "centre of the screenshot" — must be remapped
+    /// to the centre of the captured window's bounds on the monitor.
     fn dispatch_overlay(&self, commands: &[OverlayCommand]) {
         if commands.is_empty() {
             return;
@@ -172,11 +179,107 @@ impl NpcCoordinator {
             );
             return;
         };
-        if let Err(e) = overlay_driver::apply(app, commands, &self.auto_hide) {
+
+        #[cfg(target_os = "macos")]
+        let translated = Self::translate_overlay_coords(app, commands);
+        #[cfg(not(target_os = "macos"))]
+        let translated: Vec<OverlayCommand> = commands.to_vec();
+
+        if let Err(e) = overlay_driver::apply(app, &translated, &self.auto_hide) {
             eprintln!("[z-ro:npc] overlay apply failed: {}", e);
         }
     }
 
+    /// Translate each command's normalized `(x, y, width, height)` from
+    /// capture-local space into primary-monitor-local space.
+    ///
+    /// Returns the original commands unchanged when no SCK session is
+    /// active yet (the LLM's coords assume the full screen in that case)
+    /// or when the primary monitor can't be resolved.
+    #[cfg(target_os = "macos")]
+    fn translate_overlay_coords(
+        app: &AppHandle,
+        commands: &[OverlayCommand],
+    ) -> Vec<OverlayCommand> {
+        use tauri::Manager;
+
+        let bounds: Option<crate::capture::CaptureBounds> = app
+            .try_state::<crate::commands::capture::CaptureState>()
+            .and_then(|state| {
+                state
+                    .session
+                    .lock()
+                    .ok()
+                    .and_then(|slot| slot.as_ref().map(|s| s.bounds))
+            });
+        let Some(bounds) = bounds else {
+            return commands.to_vec();
+        };
+
+        let monitor = match app.primary_monitor() {
+            Ok(Some(m)) => m,
+            _ => return commands.to_vec(),
+        };
+        let scale = monitor.scale_factor();
+        let phys = monitor.size();
+        let mw = phys.width as f64 / scale;
+        let mh = phys.height as f64 / scale;
+
+        translate_overlay_coords_pure(&bounds, mw, mh, commands)
+    }
+}
+
+/// Pure function doing the capture→monitor coord math. Pulled out of
+/// the `impl` block so unit tests can exercise it without a real Tauri
+/// `AppHandle`.
+///
+/// Behaviour:
+///   - bounds cover the whole monitor (within 1 pt) → identity (avoids
+///     rounding drift and keeps arrow positions stable during full-screen
+///     share).
+///   - monitor size is invalid (≤ 0) → identity fallback.
+///   - otherwise: `(nx, ny) → ((bounds.x + nx*bounds.w)/mw, ...)`.
+///
+/// Keeping `width`/`height` translation consistent with position: a box
+/// that's 50% of a half-screen window should render as 25% of the whole
+/// monitor width.
+#[cfg(target_os = "macos")]
+pub(crate) fn translate_overlay_coords_pure(
+    bounds: &crate::capture::CaptureBounds,
+    monitor_w: f64,
+    monitor_h: f64,
+    commands: &[OverlayCommand],
+) -> Vec<OverlayCommand> {
+    if monitor_w <= 0.0 || monitor_h <= 0.0 {
+        return commands.to_vec();
+    }
+    let covers_full = bounds.origin_x.abs() < 1.0
+        && bounds.origin_y.abs() < 1.0
+        && (bounds.width - monitor_w).abs() < 1.0
+        && (bounds.height - monitor_h).abs() < 1.0;
+    if covers_full {
+        return commands.to_vec();
+    }
+    commands
+        .iter()
+        .map(|cmd| {
+            let mut out = cmd.clone();
+            if let (Some(x), Some(y)) = (cmd.x, cmd.y) {
+                let px = bounds.origin_x + (x as f64) * bounds.width;
+                let py = bounds.origin_y + (y as f64) * bounds.height;
+                out.x = Some((px / monitor_w) as f32);
+                out.y = Some((py / monitor_h) as f32);
+            }
+            if let (Some(w), Some(h)) = (cmd.width, cmd.height) {
+                out.width = Some(((w as f64) * bounds.width / monitor_w) as f32);
+                out.height = Some(((h as f64) * bounds.height / monitor_h) as f32);
+            }
+            out
+        })
+        .collect()
+}
+
+impl NpcCoordinator {
     /// List all LLM models that can be selected (filtered by configured API keys).
     pub fn list_available_models(&self) -> Vec<ModelInfo> {
         llm_providers::available_models(&self.api_keys)
@@ -729,6 +832,142 @@ mod tests {
     use async_trait::async_trait;
     use std::path::PathBuf;
     use tokio::sync::mpsc;
+
+    // ── Coord translation: tests for the pure math ────────────────────
+
+    #[cfg(target_os = "macos")]
+    fn arrow(x: f32, y: f32) -> OverlayCommand {
+        OverlayCommand {
+            action: "arrow".to_string(),
+            x: Some(x),
+            y: Some(y),
+            width: None,
+            height: None,
+            text: None,
+            color: None,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn box_cmd(x: f32, y: f32, w: f32, h: f32) -> OverlayCommand {
+        OverlayCommand {
+            action: "box".to_string(),
+            x: Some(x),
+            y: Some(y),
+            width: Some(w),
+            height: Some(h),
+            text: None,
+            color: None,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn translate_full_display_is_identity() {
+        // Captured region == entire monitor. Translation should be a no-op.
+        let bounds = crate::capture::CaptureBounds {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 1440.0,
+            height: 900.0,
+        };
+        let cmds = vec![arrow(0.5, 0.5), arrow(0.1, 0.9)];
+        let out = translate_overlay_coords_pure(&bounds, 1440.0, 900.0, &cmds);
+        assert!((out[0].x.unwrap() - 0.5).abs() < 1e-6);
+        assert!((out[0].y.unwrap() - 0.5).abs() < 1e-6);
+        assert!((out[1].x.unwrap() - 0.1).abs() < 1e-6);
+        assert!((out[1].y.unwrap() - 0.9).abs() < 1e-6);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn translate_centered_half_window_shifts_to_monitor_center() {
+        // 720×450 window centered on a 1440×900 monitor.
+        // Window bounds: (360, 225) with size (720, 450).
+        // Arrow at (0.5, 0.5) in the window = (720, 450) on monitor
+        // = (0.5, 0.5) in monitor-normalized space (still centre!) —
+        // because the window itself is centered.
+        let bounds = crate::capture::CaptureBounds {
+            origin_x: 360.0,
+            origin_y: 225.0,
+            width: 720.0,
+            height: 450.0,
+        };
+        let out = translate_overlay_coords_pure(&bounds, 1440.0, 900.0, &[arrow(0.5, 0.5)]);
+        assert!((out[0].x.unwrap() - 0.5).abs() < 1e-4);
+        assert!((out[0].y.unwrap() - 0.5).abs() < 1e-4);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn translate_top_left_window_maps_to_quarter_point() {
+        // Window at origin (0, 0) sized (720, 450) — top-left quadrant.
+        // Arrow at window-centre (0.5, 0.5) = monitor (360, 225)
+        // = (0.25, 0.25) in monitor-normalized space.
+        let bounds = crate::capture::CaptureBounds {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 720.0,
+            height: 450.0,
+        };
+        let out = translate_overlay_coords_pure(&bounds, 1440.0, 900.0, &[arrow(0.5, 0.5)]);
+        assert!((out[0].x.unwrap() - 0.25).abs() < 1e-4);
+        assert!((out[0].y.unwrap() - 0.25).abs() < 1e-4);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn translate_scales_width_and_height_consistently() {
+        // A box that's 50% wide in a 720pt window should be 25% wide on a
+        // 1440pt monitor — both the position math and size math must agree.
+        let bounds = crate::capture::CaptureBounds {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 720.0,
+            height: 450.0,
+        };
+        let out = translate_overlay_coords_pure(
+            &bounds,
+            1440.0,
+            900.0,
+            &[box_cmd(0.0, 0.0, 0.5, 0.5)],
+        );
+        assert!((out[0].width.unwrap() - 0.25).abs() < 1e-4);
+        assert!((out[0].height.unwrap() - 0.25).abs() < 1e-4);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn translate_invalid_monitor_returns_identity() {
+        let bounds = crate::capture::CaptureBounds {
+            origin_x: 100.0,
+            origin_y: 100.0,
+            width: 200.0,
+            height: 200.0,
+        };
+        let cmds = vec![arrow(0.3, 0.7)];
+        let out = translate_overlay_coords_pure(&bounds, 0.0, 0.0, &cmds);
+        assert_eq!(out[0].x, Some(0.3));
+        assert_eq!(out[0].y, Some(0.7));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn translate_preserves_non_coord_fields() {
+        let bounds = crate::capture::CaptureBounds {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 720.0,
+            height: 450.0,
+        };
+        let mut cmd = arrow(0.5, 0.5);
+        cmd.text = Some("Click here".into());
+        cmd.color = Some("green".into());
+        let out = translate_overlay_coords_pure(&bounds, 1440.0, 900.0, &[cmd]);
+        assert_eq!(out[0].text.as_deref(), Some("Click here"));
+        assert_eq!(out[0].color.as_deref(), Some("green"));
+        assert_eq!(out[0].action, "arrow");
+    }
 
     /// Mock LLM that returns a fixed response.
     struct MockLlm {

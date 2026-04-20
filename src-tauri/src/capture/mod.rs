@@ -9,7 +9,7 @@
 pub mod macos;
 
 #[cfg(target_os = "macos")]
-pub use macos::{request_picker_and_start, CaptureSession, PickerResult};
+pub use macos::{request_picker_and_start, CaptureBounds, CaptureSession, PickerResult};
 
 #[cfg(not(target_os = "macos"))]
 compile_error!(
