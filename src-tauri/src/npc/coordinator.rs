@@ -190,11 +190,12 @@ impl NpcCoordinator {
         }
     }
 
-    /// Translate each command's normalized `(x, y, width, height)` from
-    /// capture-local space into primary-monitor-local space.
+    /// Translate each command's **pixel** `(x, y, width, height)` from the
+    /// captured image into primary-monitor-local normalized space ready for
+    /// the overlay renderer.
     ///
     /// Returns the original commands unchanged when no SCK session is
-    /// active yet (the LLM's coords assume the full screen in that case)
+    /// active yet (we don't know the capture dims so we can't translate)
     /// or when the primary monitor can't be resolved.
     #[cfg(target_os = "macos")]
     fn translate_overlay_coords(
@@ -216,6 +217,16 @@ impl NpcCoordinator {
             return commands.to_vec();
         };
 
+        // Pixel dimensions of the screenshot the LLM was actually shown.
+        // Read from the live FrameBuffer so they stay in sync with SCK's
+        // delivered frames (not just the configured CAPTURE_WIDTH/HEIGHT).
+        let capture_dims: Option<(u32, u32)> = app
+            .try_state::<crate::npc::frame_buffer::FrameBuffer>()
+            .and_then(|fb| fb.latest().map(|f| (f.width, f.height)));
+        let Some((cap_w_px, cap_h_px)) = capture_dims else {
+            return commands.to_vec();
+        };
+
         let monitor = match app.primary_monitor() {
             Ok(Some(m)) => m,
             _ => return commands.to_vec(),
@@ -225,7 +236,14 @@ impl NpcCoordinator {
         let mw = phys.width as f64 / scale;
         let mh = phys.height as f64 / scale;
 
-        translate_overlay_coords_pure(&bounds, mw, mh, commands)
+        translate_overlay_coords_pure(
+            &bounds,
+            cap_w_px as f64,
+            cap_h_px as f64,
+            mw,
+            mh,
+            commands,
+        )
     }
 }
 
@@ -233,31 +251,38 @@ impl NpcCoordinator {
 /// the `impl` block so unit tests can exercise it without a real Tauri
 /// `AppHandle`.
 ///
-/// Behaviour:
-///   - bounds cover the whole monitor (within 1 pt) → identity (avoids
-///     rounding drift and keeps arrow positions stable during full-screen
-///     share).
-///   - monitor size is invalid (≤ 0) → identity fallback.
-///   - otherwise: `(nx, ny) → ((bounds.x + nx*bounds.w)/mw, ...)`.
+/// Inputs:
+///   - `bounds`: the captured region's position + size on the monitor, in
+///     logical points.
+///   - `capture_w_px`, `capture_h_px`: the screenshot's actual pixel size
+///     (what the LLM saw).
+///   - `monitor_w_pt`, `monitor_h_pt`: the primary monitor size in logical
+///     points (physical px / scale).
+///   - `commands`: LLM-emitted overlay commands whose `x`/`y`/`width`/
+///     `height` are **pixel coords** of the captured image.
 ///
-/// Keeping `width`/`height` translation consistent with position: a box
-/// that's 50% of a half-screen window should render as 25% of the whole
-/// monitor width.
+/// Output: commands with coordinates remapped to monitor-local normalized
+/// `[0, 1]` space (what the overlay webview expects).
+///
+/// Pipeline per coord: `pixel → capture-normalized → monitor point → monitor-normalized`.
+///
+/// Degenerate fallbacks (any input dim ≤ 0) short-circuit to identity so
+/// we never divide by zero, even if we then ship coords the overlay can't
+/// interpret usefully.
 #[cfg(target_os = "macos")]
 pub(crate) fn translate_overlay_coords_pure(
     bounds: &crate::capture::CaptureBounds,
-    monitor_w: f64,
-    monitor_h: f64,
+    capture_w_px: f64,
+    capture_h_px: f64,
+    monitor_w_pt: f64,
+    monitor_h_pt: f64,
     commands: &[OverlayCommand],
 ) -> Vec<OverlayCommand> {
-    if monitor_w <= 0.0 || monitor_h <= 0.0 {
-        return commands.to_vec();
-    }
-    let covers_full = bounds.origin_x.abs() < 1.0
-        && bounds.origin_y.abs() < 1.0
-        && (bounds.width - monitor_w).abs() < 1.0
-        && (bounds.height - monitor_h).abs() < 1.0;
-    if covers_full {
+    if monitor_w_pt <= 0.0
+        || monitor_h_pt <= 0.0
+        || capture_w_px <= 0.0
+        || capture_h_px <= 0.0
+    {
         return commands.to_vec();
     }
     commands
@@ -265,14 +290,22 @@ pub(crate) fn translate_overlay_coords_pure(
         .map(|cmd| {
             let mut out = cmd.clone();
             if let (Some(x), Some(y)) = (cmd.x, cmd.y) {
-                let px = bounds.origin_x + (x as f64) * bounds.width;
-                let py = bounds.origin_y + (y as f64) * bounds.height;
-                out.x = Some((px / monitor_w) as f32);
-                out.y = Some((py / monitor_h) as f32);
+                // Pixel → capture-local normalized.
+                let cap_nx = (x as f64) / capture_w_px;
+                let cap_ny = (y as f64) / capture_h_px;
+                // Capture-local → monitor-local point.
+                let px = bounds.origin_x + cap_nx * bounds.width;
+                let py = bounds.origin_y + cap_ny * bounds.height;
+                // Monitor point → monitor-local normalized (what the overlay
+                // renderer multiplies by its viewport size).
+                out.x = Some((px / monitor_w_pt) as f32);
+                out.y = Some((py / monitor_h_pt) as f32);
             }
             if let (Some(w), Some(h)) = (cmd.width, cmd.height) {
-                out.width = Some(((w as f64) * bounds.width / monitor_w) as f32);
-                out.height = Some(((h as f64) * bounds.height / monitor_h) as f32);
+                let cap_nw = (w as f64) / capture_w_px;
+                let cap_nh = (h as f64) / capture_h_px;
+                out.width = Some(((cap_nw * bounds.width) / monitor_w_pt) as f32);
+                out.height = Some(((cap_nh * bounds.height) / monitor_h_pt) as f32);
             }
             out
         })
@@ -323,6 +356,15 @@ impl NpcCoordinator {
         self.set_state(NpcState::Thinking);
         let start = std::time::Instant::now();
 
+        // Read task state first so the screen reader knows whether to
+        // always-attach the screenshot for this turn (Phase 1 accuracy).
+        let task_state = self
+            .task_machine
+            .lock()
+            .map_err(|e| format!("TaskMachine lock failed: {}", e))?
+            .get_state();
+        self.screen_reader.set_task_active(task_state.is_some());
+
         // Capture screen context
         let screen = self.screen_reader.capture().unwrap_or_else(|e| {
             eprintln!("[z-ro:npc] Screen capture failed: {}", e);
@@ -330,21 +372,11 @@ impl NpcCoordinator {
                 window: crate::context::WindowInfo {
                     title: "Unknown".to_string(),
                     process_name: "Unknown".to_string(),
-                    bundle_id: None,
-                    pid: None,
+                    ..Default::default()
                 },
-                ax_tree: None,
-                screenshot_b64: None,
-                captured_at_ms: 0,
+                ..Default::default()
             }
         });
-
-        // Read task state
-        let task_state = self
-            .task_machine
-            .lock()
-            .map_err(|e| format!("TaskMachine lock failed: {}", e))?
-            .get_state();
 
         // Get conversation history
         let history: Vec<ConversationTurn>;
@@ -470,6 +502,15 @@ impl NpcCoordinator {
         self.set_state(NpcState::Thinking);
         let start = std::time::Instant::now();
 
+        // Read task state first so the screen reader knows to attach the
+        // screenshot for guidance turns.
+        let task_state = self
+            .task_machine
+            .lock()
+            .map_err(|e| format!("TaskMachine lock failed: {}", e))?
+            .get_state();
+        self.screen_reader.set_task_active(task_state.is_some());
+
         // Capture screen context
         let screen = self.screen_reader.capture().unwrap_or_else(|e| {
             eprintln!("[z-ro:npc] Screen capture failed: {}", e);
@@ -477,21 +518,11 @@ impl NpcCoordinator {
                 window: crate::context::WindowInfo {
                     title: "Unknown".to_string(),
                     process_name: "Unknown".to_string(),
-                    bundle_id: None,
-                    pid: None,
+                    ..Default::default()
                 },
-                ax_tree: None,
-                screenshot_b64: None,
-                captured_at_ms: 0,
+                ..Default::default()
             }
         });
-
-        // Read task state
-        let task_state = self
-            .task_machine
-            .lock()
-            .map_err(|e| format!("TaskMachine lock failed: {}", e))?
-            .get_state();
 
         // Get conversation history
         let history: Vec<ConversationTurn> = {
@@ -672,6 +703,10 @@ impl NpcCoordinator {
         if milestones.is_empty() {
             return;
         }
+
+        // Keep the screen reader's task-active flag in sync so the capture()
+        // call below attaches a screenshot even in AX-rich apps.
+        self.screen_reader.set_task_active(true);
 
         // Capture fresh screen context to feed the Verifier. Cheap — AX
         // tree read + latest frame from the ring.
@@ -875,16 +910,18 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn translate_full_display_is_identity() {
-        // Captured region == entire monitor. Translation should be a no-op.
+    fn translate_full_display_pixel_center_is_half_normalized() {
+        // Captured region == entire monitor. Pixel center of the 1440×900
+        // image is (720, 450); should map to monitor-local (0.5, 0.5).
         let bounds = crate::capture::CaptureBounds {
             origin_x: 0.0,
             origin_y: 0.0,
             width: 1440.0,
             height: 900.0,
         };
-        let cmds = vec![arrow(0.5, 0.5), arrow(0.1, 0.9)];
-        let out = translate_overlay_coords_pure(&bounds, 1440.0, 900.0, &cmds);
+        let cmds = vec![arrow(720.0, 450.0), arrow(144.0, 810.0)];
+        let out =
+            translate_overlay_coords_pure(&bounds, 1440.0, 900.0, 1440.0, 900.0, &cmds);
         assert!((out[0].x.unwrap() - 0.5).abs() < 1e-6);
         assert!((out[0].y.unwrap() - 0.5).abs() < 1e-6);
         assert!((out[1].x.unwrap() - 0.1).abs() < 1e-6);
@@ -894,18 +931,24 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn translate_centered_half_window_shifts_to_monitor_center() {
-        // 720×450 window centered on a 1440×900 monitor.
-        // Window bounds: (360, 225) with size (720, 450).
-        // Arrow at (0.5, 0.5) in the window = (720, 450) on monitor
-        // = (0.5, 0.5) in monitor-normalized space (still centre!) —
-        // because the window itself is centered.
+        // 720×450 pt window centered on a 1440×900 pt monitor. Screenshot
+        // is still 1440×900 px (SCK's configured output). Arrow at pixel
+        // (720, 450) — centre of the image = centre of the window on the
+        // monitor = normalized (0.5, 0.5).
         let bounds = crate::capture::CaptureBounds {
             origin_x: 360.0,
             origin_y: 225.0,
             width: 720.0,
             height: 450.0,
         };
-        let out = translate_overlay_coords_pure(&bounds, 1440.0, 900.0, &[arrow(0.5, 0.5)]);
+        let out = translate_overlay_coords_pure(
+            &bounds,
+            1440.0,
+            900.0,
+            1440.0,
+            900.0,
+            &[arrow(720.0, 450.0)],
+        );
         assert!((out[0].x.unwrap() - 0.5).abs() < 1e-4);
         assert!((out[0].y.unwrap() - 0.5).abs() < 1e-4);
     }
@@ -913,25 +956,9 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn translate_top_left_window_maps_to_quarter_point() {
-        // Window at origin (0, 0) sized (720, 450) — top-left quadrant.
-        // Arrow at window-centre (0.5, 0.5) = monitor (360, 225)
-        // = (0.25, 0.25) in monitor-normalized space.
-        let bounds = crate::capture::CaptureBounds {
-            origin_x: 0.0,
-            origin_y: 0.0,
-            width: 720.0,
-            height: 450.0,
-        };
-        let out = translate_overlay_coords_pure(&bounds, 1440.0, 900.0, &[arrow(0.5, 0.5)]);
-        assert!((out[0].x.unwrap() - 0.25).abs() < 1e-4);
-        assert!((out[0].y.unwrap() - 0.25).abs() < 1e-4);
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn translate_scales_width_and_height_consistently() {
-        // A box that's 50% wide in a 720pt window should be 25% wide on a
-        // 1440pt monitor — both the position math and size math must agree.
+        // Window at monitor origin (0, 0) sized (720, 450) pt. Pixel
+        // center (720, 450) of the 1440×900 screenshot = point (360, 225)
+        // on the monitor = normalized (0.25, 0.25).
         let bounds = crate::capture::CaptureBounds {
             origin_x: 0.0,
             origin_y: 0.0,
@@ -942,7 +969,33 @@ mod tests {
             &bounds,
             1440.0,
             900.0,
-            &[box_cmd(0.0, 0.0, 0.5, 0.5)],
+            1440.0,
+            900.0,
+            &[arrow(720.0, 450.0)],
+        );
+        assert!((out[0].x.unwrap() - 0.25).abs() < 1e-4);
+        assert!((out[0].y.unwrap() - 0.25).abs() < 1e-4);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn translate_scales_width_and_height_consistently() {
+        // A box covering half the 1440×900 screenshot (720×450 px) maps to
+        // a region 50% of a 720pt window = 360 pt = 25% of the 1440pt
+        // monitor. Position and size math must agree.
+        let bounds = crate::capture::CaptureBounds {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 720.0,
+            height: 450.0,
+        };
+        let out = translate_overlay_coords_pure(
+            &bounds,
+            1440.0,
+            900.0,
+            1440.0,
+            900.0,
+            &[box_cmd(0.0, 0.0, 720.0, 450.0)],
         );
         assert!((out[0].width.unwrap() - 0.25).abs() < 1e-4);
         assert!((out[0].height.unwrap() - 0.25).abs() < 1e-4);
@@ -957,10 +1010,27 @@ mod tests {
             width: 200.0,
             height: 200.0,
         };
-        let cmds = vec![arrow(0.3, 0.7)];
-        let out = translate_overlay_coords_pure(&bounds, 0.0, 0.0, &cmds);
-        assert_eq!(out[0].x, Some(0.3));
-        assert_eq!(out[0].y, Some(0.7));
+        let cmds = vec![arrow(300.0, 700.0)];
+        let out = translate_overlay_coords_pure(&bounds, 1440.0, 900.0, 0.0, 0.0, &cmds);
+        // Degraded path: identity passthrough (pixel coords unchanged).
+        assert_eq!(out[0].x, Some(300.0));
+        assert_eq!(out[0].y, Some(700.0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn translate_invalid_capture_dims_returns_identity() {
+        let bounds = crate::capture::CaptureBounds {
+            origin_x: 0.0,
+            origin_y: 0.0,
+            width: 720.0,
+            height: 450.0,
+        };
+        let cmds = vec![arrow(100.0, 100.0)];
+        // Zero capture dimensions would divide by zero.
+        let out = translate_overlay_coords_pure(&bounds, 0.0, 0.0, 1440.0, 900.0, &cmds);
+        assert_eq!(out[0].x, Some(100.0));
+        assert_eq!(out[0].y, Some(100.0));
     }
 
     #[cfg(target_os = "macos")]
@@ -972,13 +1042,47 @@ mod tests {
             width: 720.0,
             height: 450.0,
         };
-        let mut cmd = arrow(0.5, 0.5);
+        let mut cmd = arrow(720.0, 450.0);
         cmd.text = Some("Click here".into());
         cmd.color = Some("green".into());
-        let out = translate_overlay_coords_pure(&bounds, 1440.0, 900.0, &[cmd]);
+        let out = translate_overlay_coords_pure(
+            &bounds,
+            1440.0,
+            900.0,
+            1440.0,
+            900.0,
+            &[cmd],
+        );
         assert_eq!(out[0].text.as_deref(), Some("Click here"));
         assert_eq!(out[0].color.as_deref(), Some("green"));
         assert_eq!(out[0].action, "arrow");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn translate_handles_retina_capture_bigger_than_monitor_points() {
+        // Retina case: window is 720×450 pt but SCK delivered a 1440×900 px
+        // screenshot (2× backing scale). The math should still work —
+        // capture dims only matter to normalize the pixel input.
+        let bounds = crate::capture::CaptureBounds {
+            origin_x: 400.0,
+            origin_y: 200.0,
+            width: 720.0,
+            height: 450.0,
+        };
+        // Arrow at pixel (1440, 900) = bottom-right of the image = bottom-
+        // right of the window on the monitor = (400+720, 200+450) =
+        // (1120, 650). Monitor 1440×900 → normalized (~0.778, ~0.722).
+        let out = translate_overlay_coords_pure(
+            &bounds,
+            1440.0,
+            900.0,
+            1440.0,
+            900.0,
+            &[arrow(1440.0, 900.0)],
+        );
+        assert!((out[0].x.unwrap() - (1120.0 / 1440.0)).abs() < 1e-4);
+        assert!((out[0].y.unwrap() - (650.0 / 900.0)).abs() < 1e-4);
     }
 
     /// Mock LLM that returns a fixed response.

@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,19 +14,25 @@ use crate::npc::frame_buffer::FrameBuffer;
 static SELF_PID: std::sync::LazyLock<u32> = std::sync::LazyLock::new(std::process::id);
 
 /// Minimum AX tree length (in bytes) below which we consider the tree "thin"
-/// and fall back to a screenshot.  Electron / canvas-heavy apps often return
-/// < 200 bytes (just a top-level window element with no children).
+/// and fall back to a screenshot on idle (no-task) turns. When a task is
+/// active the screenshot is always attached — accuracy matters more than
+/// tokens for guidance.  Electron / canvas-heavy apps often return < 200
+/// bytes (just a top-level window element with no children).
 const THIN_AX_THRESHOLD: usize = 200;
 
-/// JPEG quality for screenshots pulled from the SCK FrameBuffer.
-const SCREENSHOT_JPEG_QUALITY: u8 = 60;
+/// JPEG quality for screenshots pulled from the SCK FrameBuffer. Bumped
+/// from 60 to 80 so Haiku can resolve dense-UI targets from the image.
+const SCREENSHOT_JPEG_QUALITY: u8 = 80;
 
 /// Snapshot of the user's screen at a point in time.
 ///
-/// The primary context source is the accessibility tree (`ax_tree`), which is
-/// fast (~5-50 ms) and compact (~2-5 KB text).  A screenshot is captured only
-/// as a fallback when the AX tree is empty or for canvas-heavy apps.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Two context sources are available: the accessibility tree (`ax_tree`) —
+/// fast and compact but unreliable in Electron / canvas / browser apps —
+/// and the screenshot (`screenshot_b64`) pulled from the SCK frame ring.
+///
+/// During an active task the screenshot is always attached. Idle turns only
+/// attach it when the AX tree is thin (< 200 B).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScreenContext {
     /// Focused window metadata (app name, window title, bundle id).
     pub window: WindowInfo,
@@ -33,10 +40,26 @@ pub struct ScreenContext {
     /// Format: each line is `<indent><role_description> "<title>"`.
     /// Depth-limited to 6 levels, size-capped at 4 KB.
     pub ax_tree: Option<String>,
-    /// Base64-encoded JPEG screenshot (quality 60, max 1024px long edge).
-    /// Only populated as a fallback when the AX tree is empty or very thin
-    /// (< 200 bytes) — typical of Electron / canvas-heavy apps.
+    /// Base64-encoded JPEG screenshot (quality 80) from the SCK frame ring.
     pub screenshot_b64: Option<String>,
+    /// Pixel width of the captured screenshot — matches SCK's configured
+    /// output width. None when no capture session is live.
+    #[serde(default)]
+    pub capture_width_px: Option<u32>,
+    /// Pixel height of the captured screenshot.
+    #[serde(default)]
+    pub capture_height_px: Option<u32>,
+    /// Primary monitor width in logical points (physical px / scale). None
+    /// when the AppHandle isn't installed or the monitor can't be resolved.
+    #[serde(default)]
+    pub monitor_width_pt: Option<f64>,
+    /// Primary monitor height in logical points.
+    #[serde(default)]
+    pub monitor_height_pt: Option<f64>,
+    /// Backing scale factor the screenshot was captured at. SCK delivers
+    /// pre-scaled frames (1.0 unless the capture path changes).
+    #[serde(default)]
+    pub scale_factor: Option<f32>,
     /// Unix timestamp in milliseconds when this context was captured.
     pub captured_at_ms: u64,
 }
@@ -63,6 +86,10 @@ pub struct ScreenReader {
     /// the user picks a source via the native picker; the NPC silently runs
     /// without visual context until then (AX tree only).
     frame_buffer: FrameBuffer,
+    /// True whenever the coordinator has an active task. Used by `capture()`
+    /// to always attach a screenshot during a task so the LLM can place
+    /// arrows precisely, even in AX-rich apps.
+    task_active: Arc<AtomicBool>,
 }
 
 /// Signature used to de-dupe poll-tick log lines.  We only print a log when
@@ -78,6 +105,7 @@ impl ScreenReader {
     pub fn new(frame_buffer: FrameBuffer) -> Self {
         let last_external = Arc::new(Mutex::new(None));
         let app_handle = Arc::new(OnceLock::new());
+        let task_active = Arc::new(AtomicBool::new(false));
 
         // Background thread tracks external app focus so the LLM always has
         // AX-tree context from the window the user was last interacting with.
@@ -99,7 +127,7 @@ impl ScreenReader {
                 .expect("Failed to spawn screen polling thread");
         }
 
-        Self { last_external, app_handle, frame_buffer }
+        Self { last_external, app_handle, frame_buffer, task_active }
     }
 
     /// Install the Tauri `AppHandle` so the screen poller can emit
@@ -107,6 +135,15 @@ impl ScreenReader {
     /// `lib.rs` inside `.setup(...)`. Subsequent calls are no-ops.
     pub fn set_app_handle(&self, app: AppHandle) {
         let _ = self.app_handle.set(app);
+    }
+
+    /// Signal to the screen reader whether a task is currently active. When
+    /// `true`, `capture()` always attaches the latest screenshot regardless
+    /// of AX-tree thickness, so guidance arrows can be placed accurately in
+    /// AX-poor apps (VS Code, browsers, canvas). Called by the coordinator
+    /// whenever it reads task state for an NPC turn.
+    pub fn set_task_active(&self, active: bool) {
+        self.task_active.store(active, Ordering::Relaxed);
     }
 
     /// Capture the screen context for the NPC.
@@ -140,26 +177,57 @@ impl ScreenReader {
             (window, ax)
         };
 
-        // Screenshot comes from the SCK FrameBuffer, not from a second xcap
-        // path. Only attach when the AX tree is too thin to be useful —
-        // cloud vision tokens are the cost we're optimising for.
-        let screenshot_b64 = self.screenshot_from_buffer_if_thin(&ax_tree);
+        // Pull the latest frame ONCE — we use it for both the screenshot
+        // and the pixel-dimension metadata so the two can never drift.
+        let latest_frame = self.frame_buffer.latest();
+        let task_active = self.task_active.load(Ordering::Relaxed);
+        let thin_ax = ax_tree.as_ref().map_or(true, |t| t.len() < THIN_AX_THRESHOLD);
+        // Attach the image when a task is active (guidance needs it) OR
+        // when the AX tree is too thin to drive coord placement alone.
+        let want_screenshot = task_active || thin_ax;
+
+        let screenshot_b64 = if want_screenshot {
+            latest_frame.as_ref().and_then(|f| {
+                match f.to_jpeg_base64(SCREENSHOT_JPEG_QUALITY) {
+                    Ok(b64) => Some(b64),
+                    Err(e) => {
+                        eprintln!("[z-ro:npc] Frame→JPEG failed: {e}");
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        };
+
+        let (capture_width_px, capture_height_px, scale_factor) = latest_frame
+            .as_ref()
+            .map(|f| (Some(f.width), Some(f.height), Some(f.scale_factor)))
+            .unwrap_or((None, None, None));
+        let (monitor_width_pt, monitor_height_pt) = self.read_monitor_size();
 
         let ctx = ScreenContext {
             window: window.clone(),
             ax_tree: ax_tree.clone(),
             screenshot_b64,
+            capture_width_px,
+            capture_height_px,
+            monitor_width_pt,
+            monitor_height_pt,
+            scale_factor,
             captured_at_ms: now_millis(),
         };
 
         // Refresh last_external so subsequent "z-ro is focused" turns still
-        // see fresh AX context. We do NOT cache the screenshot here — the
-        // ring buffer is already authoritative for visuals.
+        // see fresh AX context. Strip ephemeral fields (screenshot + dims)
+        // since the live capture path will repopulate them from the ring.
         if !is_self_app(&ctx.window) {
             if let Ok(mut guard) = self.last_external.lock() {
                 *guard = Some(ScreenContext {
-                    screenshot_b64: None,
-                    ..ctx.clone()
+                    window: ctx.window.clone(),
+                    ax_tree: ctx.ax_tree.clone(),
+                    captured_at_ms: ctx.captured_at_ms,
+                    ..Default::default()
                 });
             }
         }
@@ -167,25 +235,35 @@ impl ScreenReader {
         Ok(ctx)
     }
 
-    /// Pull the latest frame out of the ring and JPEG+base64-encode it —
-    /// but only when the AX tree is too thin to drive the LLM alone.
-    /// Returns `None` when the buffer is empty (user hasn't picked a source
-    /// yet) or the AX tree is substantial enough on its own.
-    fn screenshot_from_buffer_if_thin(&self, ax_tree: &Option<String>) -> Option<String> {
-        let thin = match ax_tree {
-            Some(t) => t.len() < THIN_AX_THRESHOLD,
-            None => true,
+    /// Look up the primary monitor size in logical points via the installed
+    /// Tauri `AppHandle`. Returns `(None, None)` when the handle isn't
+    /// installed yet or when the monitor can't be resolved.
+    fn read_monitor_size(&self) -> (Option<f64>, Option<f64>) {
+        let Some(app) = self.app_handle.get() else {
+            return (None, None);
         };
-        if !thin {
-            return None;
-        }
-        let frame = self.frame_buffer.latest()?;
-        match frame.to_jpeg_base64(SCREENSHOT_JPEG_QUALITY) {
-            Ok(b64) => Some(b64),
-            Err(e) => {
-                eprintln!("[z-ro:npc] Frame→JPEG failed: {e}");
-                None
+        #[cfg(target_os = "macos")]
+        {
+            use tauri::Manager;
+            match app.primary_monitor() {
+                Ok(Some(m)) => {
+                    let scale = m.scale_factor();
+                    let phys = m.size();
+                    if scale > 0.0 {
+                        let mw = phys.width as f64 / scale;
+                        let mh = phys.height as f64 / scale;
+                        (Some(mw), Some(mh))
+                    } else {
+                        (None, None)
+                    }
+                }
+                _ => (None, None),
             }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = app;
+            (None, None)
         }
     }
 
@@ -236,13 +314,13 @@ impl ScreenReader {
             }
         }
 
-        // Cache AX context for "z-ro is focused" turns. Screenshots come
-        // from the SCK FrameBuffer, not from here.
+        // Cache AX context for "z-ro is focused" turns. Screenshots + dim
+        // metadata come from the SCK FrameBuffer at capture() time, not here.
         let ctx = ScreenContext {
             window,
             ax_tree,
-            screenshot_b64: None,
             captured_at_ms: now_millis(),
+            ..Default::default()
         };
 
         if let Ok(mut guard) = last_external.lock() {
@@ -521,8 +599,8 @@ mod tests {
                 pid: Some(1234),
             },
             ax_tree: Some("window\n  button \"OK\"\n".to_string()),
-            screenshot_b64: None,
             captured_at_ms: 1000,
+            ..Default::default()
         };
         let json = serde_json::to_string(&ctx).unwrap();
         assert!(json.contains("Finder"));
@@ -536,14 +614,36 @@ mod tests {
             window: WindowInfo {
                 process_name: "App".to_string(),
                 title: "Win".to_string(),
-                bundle_id: None,
-                pid: None,
+                ..Default::default()
             },
-            ax_tree: None,
-            screenshot_b64: None,
-            captured_at_ms: 0,
+            ..Default::default()
         };
         assert!(ctx.ax_tree.is_none());
+        assert!(ctx.capture_width_px.is_none());
+        assert!(ctx.monitor_width_pt.is_none());
+    }
+
+    #[test]
+    fn test_screen_context_roundtrip_with_capture_metadata() {
+        // New in Phase 1: capture dims + monitor dims get serialized so the
+        // prompt builder can pass them to the LLM.
+        let ctx = ScreenContext {
+            window: WindowInfo::default(),
+            ax_tree: Some("tree".to_string()),
+            screenshot_b64: Some("img".to_string()),
+            capture_width_px: Some(1440),
+            capture_height_px: Some(900),
+            monitor_width_pt: Some(1512.0),
+            monitor_height_pt: Some(982.0),
+            scale_factor: Some(2.0),
+            captured_at_ms: 42,
+        };
+        let json = serde_json::to_string(&ctx).unwrap();
+        let back: ScreenContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.capture_width_px, Some(1440));
+        assert_eq!(back.capture_height_px, Some(900));
+        assert_eq!(back.monitor_width_pt, Some(1512.0));
+        assert_eq!(back.scale_factor, Some(2.0));
     }
 
     // ── Thin-tree fallback gate tests ──────────────────────────────────

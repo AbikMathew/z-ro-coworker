@@ -63,31 +63,32 @@ pub struct VoiceTurnResult {
 
 /// An overlay command embedded in the LLM response as a fenced code block.
 ///
-/// Coordinates are NORMALIZED (0.0 – 1.0) relative to the screenshot the LLM
-/// was shown. `(0,0)` is top-left, `(1,1)` is bottom-right. The overlay driver
-/// is responsible for mapping them onto actual pixel coordinates using the
-/// current monitor size.
+/// Coordinates are **PIXEL COORDS** of the screenshot the LLM was shown —
+/// the prompt tells the model the capture dimensions (e.g. 1440×900) and
+/// asks for integer pixels in that space. `(0,0)` is top-left. The
+/// coordinator's `translate_overlay_coords_pure` maps them into
+/// monitor-local normalized space for the overlay renderer.
 ///
 /// ```text
 /// ```overlay
-/// {"action":"arrow","x":0.82,"y":0.91,"text":"Click Opus 4.7"}
+/// {"action":"arrow","x":1180,"y":820,"text":"Click Opus 4.7"}
 /// ```
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OverlayCommand {
     /// `"arrow"` | `"box"` | `"tooltip"` | `"clear"`
     pub action: String,
-    /// Normalized 0.0–1.0 horizontal position (center for arrow/tooltip,
-    /// top-left for box).
+    /// Pixel x of the target in the captured screenshot (center for
+    /// arrow/tooltip, top-left for box).
     #[serde(default)]
     pub x: Option<f32>,
-    /// Normalized 0.0–1.0 vertical position.
+    /// Pixel y of the target in the captured screenshot.
     #[serde(default)]
     pub y: Option<f32>,
-    /// Normalized 0.0–1.0 width (only for `"box"`).
+    /// Pixel width of the bounded region (only for `"box"`).
     #[serde(default)]
     pub width: Option<f32>,
-    /// Normalized 0.0–1.0 height (only for `"box"`).
+    /// Pixel height of the bounded region (only for `"box"`).
     #[serde(default)]
     pub height: Option<f32>,
     /// Optional label/tooltip text drawn near the target.
@@ -603,8 +604,8 @@ Done."#;
                 pid: Some(9999),
             },
             ax_tree: Some("window \"main.rs\"\n  editor\n    text \"fn main()\"\n".to_string()),
-            screenshot_b64: None,
             captured_at_ms: 1000,
+            ..Default::default()
         }
     }
 

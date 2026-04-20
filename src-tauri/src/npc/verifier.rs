@@ -116,12 +116,10 @@ mod tests {
             window: WindowInfo {
                 title: title.to_string(),
                 process_name: process.to_string(),
-                bundle_id: None,
-                pid: None,
+                ..Default::default()
             },
             ax_tree: ax.map(String::from),
-            screenshot_b64: None,
-            captured_at_ms: 0,
+            ..Default::default()
         }
     }
 

@@ -2,7 +2,7 @@ pub mod platform;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WindowInfo {
     pub title: String,
     pub process_name: String,

@@ -118,18 +118,23 @@ Rules:
 
 7. POINTING AT THINGS (overlay commands):
    When a visual pointer would help the student, emit an overlay command as a
-   fenced code block. Coordinates are NORMALIZED floats 0.0–1.0 relative to
-   the attached screenshot: (0,0) is the top-left corner, (1,1) is bottom-right.
-   Look at the screenshot carefully and pick accurate coordinates.
+   fenced code block. Coordinates are **integer PIXELS** of the attached
+   screenshot — the Screen Context block tells you the exact pixel
+   dimensions. `(0,0)` is the top-left corner; `(capture_width, capture_height)`
+   is the bottom-right.
+
+   Look at the screenshot carefully, measure against the stated dimensions,
+   and pick precise pixel coordinates. When in doubt, prefer a slightly
+   larger target area (use a `"box"`) over a misplaced arrow.
 
    Arrow pointing at a button or icon (most common):
    ```overlay
-   {"action":"arrow","x":0.82,"y":0.91,"text":"Click Opus 4.7"}
+   {"action":"arrow","x":1180,"y":820,"text":"Click Opus 4.7"}
    ```
 
    Box around a region:
    ```overlay
-   {"action":"box","x":0.75,"y":0.88,"width":0.18,"height":0.06,"color":"green","text":"Model picker"}
+   {"action":"box","x":1080,"y":792,"width":260,"height":54,"color":"green","text":"Model picker"}
    ```
 
    Clear any existing overlay when moving on:
@@ -139,10 +144,11 @@ Rules:
 
    Rules for overlays:
    - Emit them ONLY when pointing visually would help more than words.
-   - Study the screenshot before guessing coordinates — a wrong point is
-     worse than no point. If you can't locate the target with confidence,
-     describe it in words instead.
-   - Each arrow/box needs `x` and `y` (and for box, `width` and `height`).
+   - Use the `Capture: …` line in Screen Context to anchor your pixel
+     estimates. A wrong point is worse than no point — if you can't locate
+     the target confidently, describe it in words instead.
+   - Each arrow/box needs `x` and `y` in pixels (and for box, `width` and
+     `height` also in pixels).
    - The overlay and the sentence around it must agree — do not say
      "top-right" and then emit coordinates in the bottom-left."#
             .to_string()
@@ -159,6 +165,18 @@ Rules:
         if let Some(ref bundle) = screen.window.bundle_id {
             let _ = write!(out, "Bundle: {}\n", bundle);
         }
+        if let (Some(cw), Some(ch)) = (screen.capture_width_px, screen.capture_height_px) {
+            let _ = write!(out, "Capture: {}x{} px", cw, ch);
+            if let (Some(mw), Some(mh)) = (screen.monitor_width_pt, screen.monitor_height_pt) {
+                let scale = screen.scale_factor.unwrap_or(1.0);
+                let _ = write!(
+                    out,
+                    " (monitor {:.0}x{:.0} pt @ {:.1}x)",
+                    mw, mh, scale
+                );
+            }
+            out.push('\n');
+        }
         if let Some(ref tree) = screen.ax_tree {
             let _ = write!(out, "UI Tree:\n{}\n", tree);
         } else {
@@ -166,7 +184,9 @@ Rules:
         }
         if screen.screenshot_b64.is_some() {
             out.push_str(
-                "(screenshot attached — this app has a thin AX tree, use the image to see what the user is looking at)\n",
+                "(screenshot attached — use pixel coords in the capture size \
+                 above when pointing; study the image carefully before placing \
+                 overlays)\n",
             );
         }
         out.push('\n');
@@ -218,8 +238,7 @@ mod tests {
                 pid: Some(1234),
             },
             ax_tree: Some("window \"Documents\"\n  toolbar\n    button \"Back\"\n".to_string()),
-            screenshot_b64: None,
-            captured_at_ms: 0,
+            ..Default::default()
         }
     }
 
@@ -328,17 +347,53 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompt_teaches_normalized_overlay_schema() {
+    fn test_system_prompt_teaches_pixel_overlay_schema() {
         let pb = PromptBuilder::new();
         let sys = pb.system_prompt();
         // Coord-based overlay schema
         assert!(sys.contains("overlay"));
-        assert!(sys.contains("NORMALIZED"));
         assert!(sys.contains("arrow"));
         assert!(sys.contains("box"));
         assert!(sys.contains("clear"));
-        // Must show the 0.0-1.0 coordinate convention
-        assert!(sys.contains("0.0") || sys.contains("0.0–1.0") || sys.contains("0,0"));
+        // Phase 1 switched from normalized floats to integer pixels —
+        // guard against regressions that would reintroduce normalized coords.
+        assert!(sys.contains("PIXELS") || sys.contains("pixel"));
+        assert!(!sys.contains("NORMALIZED"));
+        assert!(!sys.contains("0.0–1.0"));
+    }
+
+    #[test]
+    fn test_screen_context_renders_capture_dims_when_available() {
+        let pb = PromptBuilder::new();
+        let screen = ScreenContext {
+            window: WindowInfo {
+                title: "main.rs".to_string(),
+                process_name: "Code".to_string(),
+                ..Default::default()
+            },
+            ax_tree: Some("window".to_string()),
+            capture_width_px: Some(1440),
+            capture_height_px: Some(900),
+            monitor_width_pt: Some(1512.0),
+            monitor_height_pt: Some(982.0),
+            scale_factor: Some(2.0),
+            ..Default::default()
+        };
+        let (_, messages) = pb.build(&screen, None, &[], "point");
+        let user_msg = &messages.last().unwrap().content;
+        // The LLM needs the capture dimensions to place pixel-coord arrows.
+        assert!(user_msg.contains("1440x900"));
+        assert!(user_msg.contains("1512"));
+        assert!(user_msg.contains("2.0x"));
+    }
+
+    #[test]
+    fn test_screen_context_omits_capture_line_when_metadata_missing() {
+        let pb = PromptBuilder::new();
+        let screen = sample_screen(); // no capture metadata
+        let (_, messages) = pb.build(&screen, None, &[], "hi");
+        let user_msg = &messages.last().unwrap().content;
+        assert!(!user_msg.contains("Capture:"));
     }
 
     #[test]
@@ -348,12 +403,10 @@ mod tests {
             window: WindowInfo {
                 title: "Untitled".to_string(),
                 process_name: "TextEdit".to_string(),
-                bundle_id: None,
                 pid: Some(5678),
+                ..Default::default()
             },
-            ax_tree: None,
-            screenshot_b64: None,
-            captured_at_ms: 0,
+            ..Default::default()
         };
         let (_, messages) = pb.build(&screen, None, &[], "Help");
         let user_msg = &messages.last().unwrap().content;
