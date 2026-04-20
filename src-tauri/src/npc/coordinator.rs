@@ -131,8 +131,22 @@ pub struct NpcCoordinator {
     /// turn covers the moment.
     last_manual_ask_at: Arc<StdMutex<Option<Instant>>>,
     /// User-controlled mute for proactive speech. When `true`, milestone
-    /// and (later) WrongMove turns are suppressed — manual asks still work.
+    /// and WrongMove turns are suppressed — manual asks still work.
     proactive_muted: Arc<AtomicBool>,
+    /// ── Phase 4 WrongMove state ─────────────────────────────────────────
+    /// How many consecutive CLICK events have occurred without the
+    /// satisfied-count advancing. Reset to 0 on any progress or on a
+    /// manual ask. When this crosses 3 AND enough time has elapsed since
+    /// the last progress, we run the judge.
+    consecutive_no_progress_clicks: Arc<StdMutex<u32>>,
+    /// Monotonic clock of the last time the satisfied-count advanced.
+    /// Used together with `consecutive_no_progress_clicks` to debounce the
+    /// judge — only fire when the user has clearly been stuck for > 5 s.
+    last_progress_at: Arc<StdMutex<Option<Instant>>>,
+    /// Window title at the time of the last tick. If the user switches
+    /// apps mid-diagnosis we bail on the judge — they may have navigated
+    /// away intentionally and the screen no longer reflects the step.
+    last_window_title: Arc<StdMutex<Option<String>>>,
 }
 
 /// Payload emitted to the frontend whenever the Verifier decides something
@@ -195,6 +209,9 @@ impl NpcCoordinator {
             last_proactive_at: Arc::new(StdMutex::new(None)),
             last_manual_ask_at: Arc::new(StdMutex::new(None)),
             proactive_muted: Arc::new(AtomicBool::new(false)),
+            consecutive_no_progress_clicks: Arc::new(StdMutex::new(0)),
+            last_progress_at: Arc::new(StdMutex::new(None)),
+            last_window_title: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -1051,6 +1068,36 @@ impl NpcCoordinator {
             }
         }
 
+        // ── Phase 4 WrongMove bookkeeping ────────────────────────────────
+        let is_click = matches!(event, crate::npc::events::NpcEvent::Click { .. });
+        let current_window_title = screen.window.title.clone();
+        // Window stability: was the user in the same app a tick ago?
+        let window_stable = if let Ok(slot) = self.last_window_title.lock() {
+            slot.as_deref() == Some(current_window_title.as_str())
+        } else {
+            false
+        };
+        if let Ok(mut slot) = self.last_window_title.lock() {
+            *slot = Some(current_window_title.clone());
+        }
+
+        if progressed {
+            // User made progress — reset the WrongMove debounce state.
+            if let Ok(mut slot) = self.consecutive_no_progress_clicks.lock() {
+                *slot = 0;
+            }
+            if let Ok(mut slot) = self.last_progress_at.lock() {
+                *slot = Some(Instant::now());
+            }
+        } else if is_click {
+            // No progress AND a click: bump the counter. Keypresses don't
+            // count — typing often happens mid-click-sequence and isn't a
+            // reliable signal that the user is stuck.
+            if let Ok(mut slot) = self.consecutive_no_progress_clicks.lock() {
+                *slot = slot.saturating_add(1);
+            }
+        }
+
         // Fire a proactive speech if we just advanced the satisfied count.
         // This lives AFTER the match so it runs for both the "all done"
         // branch (last milestone just confirmed) and mid-step progress.
@@ -1059,6 +1106,9 @@ impl NpcCoordinator {
                 self.maybe_fire_proactive_for_milestone(&task_state, &m)
                     .await;
             }
+        } else if is_click {
+            self.maybe_fire_wrong_move(&task_state, &screen, window_stable)
+                .await;
         }
     }
 
@@ -1120,6 +1170,116 @@ impl NpcCoordinator {
             milestone.id
         );
         let _ = self.ask_proactive(prompt, "milestone").await;
+    }
+
+    /// Phase 4: decide whether to run the LLM judge and, if it says the
+    /// user is off-track, fire a corrective proactive speech with a fresh
+    /// screenshot and a new arrow.
+    ///
+    /// Debounce: only runs when the user has clicked ≥ 3 times without
+    /// progress AND > 5 s has elapsed since the last progress event AND
+    /// the window title hasn't changed (they're still in the same app).
+    /// Respects the mute toggle and the 10 s global proactive cooldown.
+    #[cfg(target_os = "macos")]
+    async fn maybe_fire_wrong_move(
+        &self,
+        task_state: &crate::task_engine::types::TaskState,
+        screen: &super::screen_reader::ScreenContext,
+        window_stable: bool,
+    ) {
+        const WRONG_MOVE_CLICK_THRESHOLD: u32 = 3;
+        const WRONG_MOVE_ELAPSED: Duration = Duration::from_secs(5);
+        const PROACTIVE_COOLDOWN: Duration = Duration::from_secs(10);
+        const MANUAL_ASK_BLACKOUT: Duration = Duration::from_secs(2);
+
+        if !window_stable {
+            return;
+        }
+        if self.proactive_muted.load(Ordering::Relaxed) {
+            return;
+        }
+        let click_count = self
+            .consecutive_no_progress_clicks
+            .lock()
+            .map(|g| *g)
+            .unwrap_or(0);
+        if click_count < WRONG_MOVE_CLICK_THRESHOLD {
+            return;
+        }
+        let now = Instant::now();
+        // If we've never recorded a progress event we give the user a grace
+        // period based on the counter itself — 3+ clicks with nothing is
+        // still a stuck signal even if no milestone has ever flipped.
+        let elapsed_ok = match self.last_progress_at.lock().ok().and_then(|g| *g) {
+            Some(last) => now.duration_since(last) >= WRONG_MOVE_ELAPSED,
+            None => click_count >= WRONG_MOVE_CLICK_THRESHOLD,
+        };
+        if !elapsed_ok {
+            return;
+        }
+        // Share the proactive cooldown so a milestone speech that just
+        // fired doesn't get immediately undercut by a WrongMove.
+        if let Ok(slot) = self.last_proactive_at.lock() {
+            if let Some(last) = *slot {
+                if now.duration_since(last) < PROACTIVE_COOLDOWN {
+                    return;
+                }
+            }
+        }
+        if let Ok(slot) = self.last_manual_ask_at.lock() {
+            if let Some(last) = *slot {
+                if now.duration_since(last) < MANUAL_ASK_BLACKOUT {
+                    return;
+                }
+            }
+        }
+
+        // Reset the click counter BEFORE the judge runs so a slow judge
+        // call + concurrent click doesn't stack a second fire on top.
+        if let Ok(mut slot) = self.consecutive_no_progress_clicks.lock() {
+            *slot = 0;
+        }
+
+        // Run the judge. Haiku only sees the screenshot + the step goal —
+        // cheap, fast, bounded by the existing cancellation primitive's
+        // absence here (judge is a one-shot; no cancel handle needed for v1).
+        println!(
+            "[z-ro:npc] WrongMove: {} no-progress clicks, running judge",
+            click_count
+        );
+        let verdict = self
+            .pipeline
+            .judge_unexpected_action(&task_state.current_step.instruction, screen)
+            .await;
+        let Some(verdict) = verdict else {
+            println!("[z-ro:npc] WrongMove: judge undecided/unavailable, skipping");
+            return;
+        };
+        if !verdict.unexpected {
+            println!("[z-ro:npc] WrongMove: judge says on-track, skipping");
+            return;
+        }
+
+        // Commit to firing — mark cooldown so back-to-back triggers don't
+        // stack. Reusing last_proactive_at because we share the 10 s gate.
+        if let Ok(mut slot) = self.last_proactive_at.lock() {
+            *slot = Some(Instant::now());
+        }
+
+        let reason = if verdict.reason.trim().is_empty() {
+            "you don't look on track".to_string()
+        } else {
+            verdict.reason
+        };
+        let prompt = format!(
+            "[WRONG MOVE] Latest user action didn't advance the step. \
+             Current goal: \"{}\". Observed: {}. \
+             Give ONE new overlay arrow + one short corrective sentence \
+             (max 15 words).",
+            task_state.current_step.instruction, reason,
+        );
+        println!("[z-ro:npc] WrongMove: firing correction speech");
+        let _ = self.ask_proactive(prompt, "wrong_move").await;
     }
 
     /// Helper for the Verifier: reconstitutes a FrameBuffer handle from
@@ -1510,6 +1670,49 @@ mod tests {
             .ask_proactive("[MILESTONE PROGRESS] test".to_string(), "milestone")
             .await;
         assert!(result.is_err(), "proactive must refuse when not idle");
+    }
+
+    #[test]
+    fn test_wrong_move_state_defaults() {
+        let coord = make_coordinator("hello");
+        assert_eq!(*coord.consecutive_no_progress_clicks.lock().unwrap(), 0);
+        assert!(coord.last_progress_at.lock().unwrap().is_none());
+        assert!(coord.last_window_title.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_extract_json_object_strips_fences() {
+        use super::super::voice::pipeline::extract_json_object_test_hook as extract;
+        let noisy = "Here's my verdict:\n```json\n{\"unexpected\": true, \"reason\": \"in Finder, not Terminal\"}\n```\nHope that helps!";
+        let extracted = extract(noisy).unwrap();
+        assert!(extracted.contains("\"unexpected\": true"));
+        assert!(extracted.contains("in Finder"));
+    }
+
+    #[test]
+    fn test_extract_json_object_balances_nested_braces() {
+        use super::super::voice::pipeline::extract_json_object_test_hook as extract;
+        // Nested objects shouldn't trip the depth counter.
+        let s = r#"{"outer": true, "inner": {"a": 1, "b": {"c": 2}}, "end": "yes"}"#;
+        let extracted = extract(s).unwrap();
+        assert_eq!(extracted, s);
+    }
+
+    #[test]
+    fn test_extract_json_object_tolerates_escaped_quotes() {
+        use super::super::voice::pipeline::extract_json_object_test_hook as extract;
+        // A `}` inside a string must not close the object.
+        let s = r#"preamble {"reason": "user clicked \"}\" by mistake", "unexpected": true} trailing"#;
+        let extracted = extract(s).unwrap();
+        assert!(extracted.contains("unexpected"));
+        assert!(extracted.ends_with('}'));
+    }
+
+    #[test]
+    fn test_extract_json_object_returns_none_on_garbage() {
+        use super::super::voice::pipeline::extract_json_object_test_hook as extract;
+        assert!(extract("no json here").is_none());
+        assert!(extract("{ unbalanced").is_none());
     }
 
     #[tokio::test]

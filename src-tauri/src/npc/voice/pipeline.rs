@@ -39,6 +39,14 @@ pub trait LlmProvider: Send + Sync {
 
 // ── Pipeline result types ──────────────────────────────────────────────
 
+/// Verdict returned by the Phase 4 WrongMove judge. `unexpected` is the
+/// trigger; `reason` is a short sentence Zee folds into her correction.
+#[derive(Debug, Clone)]
+pub struct JudgeVerdict {
+    pub unexpected: bool,
+    pub reason: String,
+}
+
 /// The result of a single NPC interaction turn.
 #[derive(Debug, Clone)]
 pub struct TurnResult {
@@ -295,6 +303,71 @@ impl VoicePipeline {
         })
     }
 
+    /// Phase 4 WrongMove judge. Asks the current LLM whether the user's
+    /// latest action was off-track given the step goal. Uses the same
+    /// provider as the main turn pipeline — cheap on Haiku — and a strict
+    /// JSON-only response schema.
+    ///
+    /// Returns `None` when the LLM is unavailable, the response can't be
+    /// parsed, or no screenshot was attached (the judge relies on vision).
+    /// The caller then treats the absence as "Undecided" and skips firing.
+    pub async fn judge_unexpected_action(
+        &self,
+        step_instruction: &str,
+        screen: &ScreenContext,
+    ) -> Option<JudgeVerdict> {
+        // Vision-required: refuse to guess without the image.
+        screen.screenshot_b64.as_ref()?;
+
+        let llm = self.current_llm();
+        let system = "You are a silent watcher helping a coworker. Given a \
+                      step goal and a screenshot of the user's current \
+                      screen, decide whether the user's latest action took \
+                      them off-track from the step goal. Reply with JSON \
+                      ONLY, no prose, no code fences: \
+                      {\"unexpected\": <true|false>, \"reason\": \"<≤12 \
+                      words on what you see that suggests off-track, or \
+                      empty string if on-track>\"}. Err toward false — \
+                      only say true when the screen clearly shows the \
+                      user in the wrong app or state for the goal.";
+        let user_text = format!(
+            "Step goal: \"{}\"\nWindow: {}\nIs the user off-track? JSON only.",
+            step_instruction.trim(),
+            screen.window.title,
+        );
+        let messages = vec![LlmMessage {
+            role: "user".to_string(),
+            content: user_text,
+            images_b64: screen
+                .screenshot_b64
+                .as_ref()
+                .map(|b| vec![b.clone()])
+                .unwrap_or_default(),
+        }];
+
+        let mut rx = llm.stream_chat(system, &messages).await.ok()?;
+        let mut response = String::new();
+        while let Some(chunk) = rx.recv().await {
+            response.push_str(&chunk);
+        }
+
+        // Find the JSON object — model may wrap with fences despite our
+        // instructions (Haiku sometimes does). Extract the first {...}.
+        let json_str = extract_json_object(&response)?;
+
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            unexpected: bool,
+            #[serde(default)]
+            reason: String,
+        }
+        let raw: Raw = serde_json::from_str(json_str).ok()?;
+        Some(JudgeVerdict {
+            unexpected: raw.unexpected,
+            reason: raw.reason,
+        })
+    }
+
     /// Process a full voice turn: audio → STT → LLM → TTS.
     ///
     /// 1. Transcribe audio to text via STT
@@ -402,6 +475,49 @@ fn parse_overlay_commands(text: &str) -> Vec<OverlayCommand> {
     }
 
     commands
+}
+
+/// Re-export for unit tests living in sibling modules (coordinator.rs
+/// currently). Avoids having to host Phase 4 JSON-extraction tests inside
+/// the pipeline test module purely for visibility.
+#[cfg(test)]
+pub(crate) fn extract_json_object_test_hook(text: &str) -> Option<&str> {
+    extract_json_object(text)
+}
+
+/// Extract the first balanced `{...}` object from a string. Used by the
+/// Phase 4 judge to tolerate Haiku wrapping JSON in prose or code fences.
+/// Returns `None` if no balanced pair is found.
+fn extract_json_object(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return text.get(start..=i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Remove overlay code blocks from text, leaving only the spoken/displayed parts.
