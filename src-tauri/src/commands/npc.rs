@@ -72,6 +72,17 @@ pub async fn npc_set_on_air(
     Ok(())
 }
 
+/// Mute Zee's proactive speech (milestone progress + WrongMove). Manual
+/// asks are unaffected. Persisted on the frontend via localStorage.
+#[tauri::command]
+pub async fn npc_set_proactive_muted(
+    muted: bool,
+    coordinator: State<'_, Arc<NpcCoordinator>>,
+) -> Result<(), String> {
+    coordinator.set_proactive_muted(muted);
+    Ok(())
+}
+
 /// Process a voice turn: base64-encoded audio bytes in, transcript + TTS audio out.
 ///
 /// `filename` is a hint for the STT provider (e.g. `"audio.webm"`).

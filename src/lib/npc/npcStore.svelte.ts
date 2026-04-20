@@ -82,6 +82,18 @@ class NpcStore {
     }
   }
 
+  /**
+   * Mute Zee's proactive (milestone/WrongMove) speech on the backend.
+   * Manual asks are unaffected. Fire-and-forget.
+   */
+  async setProactiveMuted(muted: boolean): Promise<void> {
+    try {
+      await invoke("npc_set_proactive_muted", { muted });
+    } catch (e) {
+      console.warn("[npc] setProactiveMuted failed:", e);
+    }
+  }
+
   async askText(question: string): Promise<string> {
     this.status.state = "Thinking";
     try {

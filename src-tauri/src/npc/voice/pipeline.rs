@@ -247,6 +247,54 @@ impl VoicePipeline {
         self.tts.is_some()
     }
 
+    /// Process a proactive/system-triggered turn: text → LLM → TTS.
+    ///
+    /// Used by Phase 3 (milestone progress) and Phase 4 (WrongMove
+    /// correction) where the "user input" is a tagged system prompt the
+    /// coordinator authored, not something the user typed or spoke. Output
+    /// shape matches a voice turn so the frontend can render a chat bubble
+    /// + play the TTS audio with no separate code path.
+    ///
+    /// Intentionally reuses `process_text_turn` for the LLM work so prompt
+    /// assembly, overlay parsing, and cancellation behave identically.
+    pub async fn process_proactive_turn(
+        &self,
+        trigger_text: &str,
+        screen: &ScreenContext,
+        task: Option<&TaskState>,
+        history: &[ConversationTurn],
+        cancel: &InterruptHandle,
+    ) -> Result<VoiceTurnResult, String> {
+        let turn = self
+            .process_text_turn(trigger_text, screen, task, history, cancel)
+            .await?;
+
+        let (audio_mime, audio_bytes) = match &self.tts {
+            Some(tts) if !turn.assistant_text.trim().is_empty() => {
+                let cancelled = cancel.cancelled();
+                tokio::pin!(cancelled);
+                tokio::select! {
+                    biased;
+                    () = &mut cancelled => {
+                        println!("[z-ro:npc] proactive TTS cancelled mid-synthesis");
+                        return Err(CANCELLED_ERR.to_string());
+                    }
+                    synth = tts.synthesize(&turn.assistant_text) => {
+                        let synth = synth?;
+                        (synth.mime, synth.bytes)
+                    }
+                }
+            }
+            _ => (String::new(), Vec::new()),
+        };
+
+        Ok(VoiceTurnResult {
+            turn,
+            audio_mime,
+            audio_bytes,
+        })
+    }
+
     /// Process a full voice turn: audio → STT → LLM → TTS.
     ///
     /// 1. Transcribe audio to text via STT

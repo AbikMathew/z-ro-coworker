@@ -34,6 +34,19 @@
   let onAirBusy = $state(false); // prevents double-click race while starting
   let onAirMicLive = $state(false); // true while VAD is in a speaking state
 
+  // Proactive speech mute (Phase 3). When true, Zee still reacts via the
+  // verifier but doesn't speak on milestone flips. Persisted separately
+  // from on-air so muting doesn't force the user to switch voice modes.
+  const LS_PROACTIVE_MUTED_KEY = "zro:npc:proactiveMuted";
+  let proactiveMuted = $state(false);
+
+  interface ProactiveTurnEvent {
+    source: "milestone" | "wrong_move";
+    text: string;
+    audio_b64: string;
+    audio_mime: string;
+  }
+
   // Reactive milestone progress: which milestone the Verifier last signalled
   // on, and whether it's confirmed. Keyed by milestone_id so repeated events
   // (every click fires this) don't pile up — the latest state wins.
@@ -86,12 +99,40 @@
       milestoneProgress = {};
     });
 
-    // Re-enable on-air from the last session if the user left it on.
-    // Deliberately kicked off after activate() so backend state is fresh.
+    // Phase 3 — Zee speaks on her own when a milestone flips. The backend
+    // decides cooldown + mute; we just render the bubble and play audio.
+    const unlistenProactive = listen<ProactiveTurnEvent>(
+      "npc-proactive-turn",
+      (event) => {
+        const p = event.payload;
+        if (p.text?.trim()) {
+          messages = [
+            ...messages,
+            {
+              role: "npc",
+              content:
+                (p.source === "wrong_move" ? "⚠ " : "✨ ") + p.text,
+            },
+          ];
+          scrollToBottom();
+        }
+        if (p.audio_b64 && p.audio_mime) {
+          playAudio(p.audio_b64, p.audio_mime);
+        }
+      },
+    );
+
+    // Restore persisted prefs. Do this after activate() so the backend
+    // flag is set via the same code path the toggle uses.
     try {
-      const saved = localStorage.getItem(LS_ON_AIR_KEY);
-      if (saved === "true") {
+      const savedOnAir = localStorage.getItem(LS_ON_AIR_KEY);
+      if (savedOnAir === "true") {
         void enableOnAir();
+      }
+      const savedMuted = localStorage.getItem(LS_PROACTIVE_MUTED_KEY);
+      if (savedMuted === "true") {
+        proactiveMuted = true;
+        void npc.setProactiveMuted(true);
       }
     } catch {
       /* localStorage may be unavailable — non-fatal */
@@ -104,6 +145,7 @@
       unlistenInterrupt.then((u) => u()).catch(() => {});
       unlistenProgress.then((u) => u()).catch(() => {});
       unlistenTaskState.then((u) => u()).catch(() => {});
+      unlistenProactive.then((u) => u()).catch(() => {});
     };
   });
 
@@ -456,6 +498,16 @@
     }
   }
 
+  function toggleProactiveMuted() {
+    proactiveMuted = !proactiveMuted;
+    void npc.setProactiveMuted(proactiveMuted);
+    try {
+      localStorage.setItem(LS_PROACTIVE_MUTED_KEY, String(proactiveMuted));
+    } catch {
+      /* non-fatal */
+    }
+  }
+
   /** Barge-in: cancels any in-flight turn (LLM stream, TTS synthesis, audio
    *  playback) and returns the NPC to Idle. Wired to a small "Stop" button
    *  that only appears while Zee is Thinking or Speaking. */
@@ -493,6 +545,22 @@
       </p>
     </div>
     <EventsBadge />
+    <button
+      type="button"
+      onclick={toggleProactiveMuted}
+      aria-pressed={proactiveMuted}
+      aria-label={proactiveMuted
+        ? "Proactive speech muted — click to unmute"
+        : "Mute Zee's proactive speech"}
+      title={proactiveMuted
+        ? "Zee won't speak on milestone progress (muted)"
+        : "Zee speaks when you make progress — click to mute"}
+      class="text-[11px] px-1.5 py-0.5 rounded border transition-colors {proactiveMuted
+        ? 'border-gray-700 text-gray-500 hover:text-gray-400'
+        : 'border-blue-600/40 text-blue-400 hover:text-blue-300'}"
+    >
+      {proactiveMuted ? "🔕" : "🔔"}
+    </button>
     {#if onAirEnabled}
       <div
         class="flex items-center gap-1 text-[11px] font-medium"

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::AppHandle;
 use tokio::sync::{watch, Mutex};
 
@@ -114,6 +114,25 @@ pub struct NpcCoordinator {
     /// Lives outside `NpcState` so `handle_user_event`'s `Idle` gate keeps
     /// firing the reactive loop between utterances.
     on_air_active: Arc<AtomicBool>,
+    /// ── Phase 3 proactive speech state ──────────────────────────────────
+    /// How many milestones on the current step were confirmed last time
+    /// `first_unsatisfied` ran. We fire a proactive ask when this count
+    /// *advances*. Reset to 0 on step advance.
+    last_satisfied_count: Arc<StdMutex<usize>>,
+    /// The milestone id we last *spoke about*. Prevents Zee repeating
+    /// herself if the reactive loop re-evaluates the same state twice.
+    last_spoken_milestone_id: Arc<StdMutex<Option<String>>>,
+    /// Monotonic clock of the last proactive ask Zee fired. Used to enforce
+    /// a global 10 s cooldown so bursts of milestone flips don't chain
+    /// into rapid-fire speeches.
+    last_proactive_at: Arc<StdMutex<Option<Instant>>>,
+    /// Monotonic clock of the last manual user ask (text or voice). Used
+    /// to skip a proactive ask when the user just spoke — their own
+    /// turn covers the moment.
+    last_manual_ask_at: Arc<StdMutex<Option<Instant>>>,
+    /// User-controlled mute for proactive speech. When `true`, milestone
+    /// and (later) WrongMove turns are suppressed — manual asks still work.
+    proactive_muted: Arc<AtomicBool>,
 }
 
 /// Payload emitted to the frontend whenever the Verifier decides something
@@ -129,6 +148,22 @@ pub struct MilestoneProgress {
     pub index: usize,
     /// Total number of milestones on this step.
     pub total: usize,
+}
+
+/// Payload emitted on the `npc-proactive-turn` event whenever Zee speaks
+/// without the user initiating — Phase 3 milestone-progress, Phase 4
+/// WrongMove corrections. The frontend appends a chat bubble and plays
+/// the audio (if present).
+#[derive(Debug, Clone, Serialize)]
+pub struct ProactiveTurnEvent {
+    /// `"milestone"` | `"wrong_move"` — lets the UI tag the bubble.
+    pub source: &'static str,
+    /// Assistant text (overlay fenced blocks already stripped).
+    pub text: String,
+    /// Base64-encoded TTS audio. Empty when TTS isn't configured.
+    pub audio_b64: String,
+    /// MIME type of `audio_b64`, or empty string.
+    pub audio_mime: String,
 }
 
 impl NpcCoordinator {
@@ -155,6 +190,11 @@ impl NpcCoordinator {
             auto_hide: overlay_driver::new_auto_hide_state(),
             interrupt: InterruptController::new(),
             on_air_active: Arc::new(AtomicBool::new(false)),
+            last_satisfied_count: Arc::new(StdMutex::new(0)),
+            last_spoken_milestone_id: Arc::new(StdMutex::new(None)),
+            last_proactive_at: Arc::new(StdMutex::new(None)),
+            last_manual_ask_at: Arc::new(StdMutex::new(None)),
+            proactive_muted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -172,6 +212,20 @@ impl NpcCoordinator {
     /// True when the frontend has on-air continuous voice mode enabled.
     pub fn is_on_air_active(&self) -> bool {
         self.on_air_active.load(Ordering::Relaxed)
+    }
+
+    /// Mute Zee's proactive (milestone/WrongMove) speech. Manual asks are
+    /// unaffected. Persisted on the frontend via localStorage.
+    pub fn set_proactive_muted(&self, muted: bool) {
+        self.proactive_muted.store(muted, Ordering::Relaxed);
+        println!(
+            "[z-ro:npc] proactive speech {}",
+            if muted { "MUTED" } else { "unmuted" }
+        );
+    }
+
+    pub fn is_proactive_muted(&self) -> bool {
+        self.proactive_muted.load(Ordering::Relaxed)
     }
 
     /// Install the Tauri `AppHandle` so the overlay driver can emit events
@@ -380,6 +434,11 @@ impl NpcCoordinator {
     pub async fn ask_text(&self, question: String) -> Result<String, String> {
         self.set_state(NpcState::Thinking);
         let start = std::time::Instant::now();
+        // Record the manual ask so a proactive turn doesn't fire on top
+        // of the user's own question for the next few seconds.
+        if let Ok(mut slot) = self.last_manual_ask_at.lock() {
+            *slot = Some(Instant::now());
+        }
 
         // Read task state first so the screen reader knows whether to
         // always-attach the screenshot for this turn (Phase 1 accuracy).
@@ -526,6 +585,9 @@ impl NpcCoordinator {
 
         self.set_state(NpcState::Thinking);
         let start = std::time::Instant::now();
+        if let Ok(mut slot) = self.last_manual_ask_at.lock() {
+            *slot = Some(Instant::now());
+        }
 
         // Read task state first so the screen reader knows to attach the
         // screenshot for guidance turns.
@@ -633,6 +695,137 @@ impl NpcCoordinator {
             }
             Err(e) => {
                 eprintln!("[z-ro:npc] Voice pipeline error: {}", e);
+                self.set_state(NpcState::Error(e.clone()));
+                Err(e)
+            }
+        }
+    }
+
+    /// Fire a proactive (system-triggered) turn. Unlike `ask_text`, the
+    /// `trigger_text` is NOT stored in conversation memory — it's a
+    /// tagged system prompt ([MILESTONE PROGRESS] / [WRONG MOVE]) that
+    /// the user never typed, and we don't want it polluting future turns.
+    /// Only Zee's reply is persisted so the next manual ask has useful
+    /// context.
+    ///
+    /// Emits `npc-proactive-turn` event with `{text, audio_b64, audio_mime,
+    /// source}` so the frontend can append a chat bubble + play the audio.
+    ///
+    /// Callers are responsible for any cooldown / mute gating — this
+    /// method just does the work.
+    pub async fn ask_proactive(
+        &self,
+        trigger_text: String,
+        source: &'static str,
+    ) -> Result<(), String> {
+        use base64::Engine;
+
+        // Don't stomp a turn that's already running.
+        if !matches!(*self.state_rx.borrow(), NpcState::Idle) {
+            return Err("not idle".to_string());
+        }
+        self.set_state(NpcState::Thinking);
+        let start = std::time::Instant::now();
+
+        // Read task state + keep screen-reader gate in sync (Phase 1).
+        let task_state = self
+            .task_machine
+            .lock()
+            .map_err(|e| format!("TaskMachine lock failed: {}", e))?
+            .get_state();
+        self.screen_reader.set_task_active(task_state.is_some());
+
+        let screen = self.screen_reader.capture().unwrap_or_else(|e| {
+            eprintln!("[z-ro:npc] proactive capture failed: {}", e);
+            super::screen_reader::ScreenContext {
+                window: crate::context::WindowInfo {
+                    title: "Unknown".to_string(),
+                    process_name: "Unknown".to_string(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        });
+
+        let history: Vec<ConversationTurn> = {
+            let mem = self.conversation.lock().await;
+            mem.recent(10).to_vec()
+        };
+
+        let cancel = self.interrupt.new_turn();
+        let result = self
+            .pipeline
+            .process_proactive_turn(
+                &trigger_text,
+                &screen,
+                task_state.as_ref(),
+                &history,
+                &cancel,
+            )
+            .await;
+
+        match result {
+            Ok(vt) => {
+                println!(
+                    "[z-ro:npc] proactive ({}) | total={}ms text=\"{}\" audio={}B",
+                    source,
+                    start.elapsed().as_millis(),
+                    vt.turn.assistant_text,
+                    vt.audio_bytes.len()
+                );
+
+                // Store ONLY the assistant turn — the tagged trigger is a
+                // system construct; future prompts don't benefit from it.
+                {
+                    let now_ms = now_millis();
+                    let screen_summary = format!(
+                        "{} - {}",
+                        screen.window.process_name, screen.window.title
+                    );
+                    let mut mem = self.conversation.lock().await;
+                    mem.push(ConversationTurn {
+                        role: "assistant".to_string(),
+                        content: vt.turn.assistant_text.clone(),
+                        timestamp_ms: now_ms,
+                        screen_summary: Some(screen_summary),
+                    });
+                }
+
+                self.dispatch_overlay(&vt.turn.overlay_commands);
+
+                if !vt.audio_bytes.is_empty() {
+                    self.set_state(NpcState::Speaking);
+                }
+                let audio_b64 = if vt.audio_bytes.is_empty() {
+                    String::new()
+                } else {
+                    base64::engine::general_purpose::STANDARD.encode(&vt.audio_bytes)
+                };
+
+                if let Some(app) = self.app_handle.get() {
+                    use tauri::Emitter;
+                    let _ = app.emit(
+                        "npc-proactive-turn",
+                        &ProactiveTurnEvent {
+                            source,
+                            text: vt.turn.assistant_text,
+                            audio_b64,
+                            audio_mime: vt.audio_mime,
+                        },
+                    );
+                }
+
+                self.set_state(NpcState::Idle);
+                Ok(())
+            }
+            Err(e) if e == CANCELLED_ERR => {
+                println!("[z-ro:npc] proactive cancelled after {}ms", start.elapsed().as_millis());
+                self.clear_overlay_on_interrupt();
+                self.set_state(NpcState::Idle);
+                Err(CANCELLED_ERR.to_string())
+            }
+            Err(e) => {
+                eprintln!("[z-ro:npc] proactive pipeline error: {}", e);
                 self.set_state(NpcState::Error(e.clone()));
                 Err(e)
             }
@@ -750,6 +943,27 @@ impl NpcCoordinator {
             crate::npc::events::NpcEvent::KeyPress { .. } => "key",
         };
 
+        // Current satisfied count: `i` when first_unsatisfied is Some(i, _),
+        // or the full length when None (all confirmed). Comparing against
+        // `last_satisfied_count` tells us whether progress happened this tick.
+        let new_count = match &unsatisfied {
+            None => milestones.len(),
+            Some((i, _, _)) => *i,
+        };
+        let prior_count = self
+            .last_satisfied_count
+            .lock()
+            .map(|g| *g)
+            .unwrap_or(0);
+        let progressed = new_count > prior_count;
+        // The milestone that just flipped Confirmed — safe to read only when
+        // progress was made (prior_count < new_count ≤ milestones.len()).
+        let just_confirmed = if progressed {
+            milestones.get(new_count.saturating_sub(1)).cloned()
+        } else {
+            None
+        };
+
         match unsatisfied {
             None => {
                 // Every milestone passes — advance the step.
@@ -796,6 +1010,14 @@ impl NpcCoordinator {
                         next_state.total_steps,
                         next_state.current_step.id
                     );
+                    // Step just flipped — reset the satisfied-count tracker
+                    // to 0 so the new step's milestones start from scratch.
+                    if let Ok(mut slot) = self.last_satisfied_count.lock() {
+                        *slot = 0;
+                    }
+                } else if let Ok(mut slot) = self.last_satisfied_count.lock() {
+                    // Task done — nothing to track.
+                    *slot = 0;
                 }
             }
             Some((i, m, result)) => {
@@ -821,8 +1043,83 @@ impl NpcCoordinator {
                         },
                     );
                 }
+                // Snapshot the new satisfied-count so the next tick can
+                // tell whether progress happened.
+                if let Ok(mut slot) = self.last_satisfied_count.lock() {
+                    *slot = new_count;
+                }
             }
         }
+
+        // Fire a proactive speech if we just advanced the satisfied count.
+        // This lives AFTER the match so it runs for both the "all done"
+        // branch (last milestone just confirmed) and mid-step progress.
+        if progressed {
+            if let Some(m) = just_confirmed {
+                self.maybe_fire_proactive_for_milestone(&task_state, &m)
+                    .await;
+            }
+        }
+    }
+
+    /// Decide whether Zee should speak about a freshly-confirmed milestone,
+    /// and fire `ask_proactive` if so. All gating lives here:
+    ///   - mute toggle
+    ///   - 10 s global cooldown since the last proactive ask
+    ///   - skip if user manually asked within the last 2 s
+    ///   - skip if we already spoke about this specific milestone
+    #[cfg(target_os = "macos")]
+    async fn maybe_fire_proactive_for_milestone(
+        &self,
+        task_state: &crate::task_engine::types::TaskState,
+        milestone: &crate::task_engine::types::Milestone,
+    ) {
+        const PROACTIVE_COOLDOWN: Duration = Duration::from_secs(10);
+        const MANUAL_ASK_BLACKOUT: Duration = Duration::from_secs(2);
+
+        if self.proactive_muted.load(Ordering::Relaxed) {
+            return;
+        }
+        let now = Instant::now();
+        if let Ok(slot) = self.last_proactive_at.lock() {
+            if let Some(last) = *slot {
+                if now.duration_since(last) < PROACTIVE_COOLDOWN {
+                    return;
+                }
+            }
+        }
+        if let Ok(slot) = self.last_manual_ask_at.lock() {
+            if let Some(last) = *slot {
+                if now.duration_since(last) < MANUAL_ASK_BLACKOUT {
+                    return;
+                }
+            }
+        }
+        if let Ok(slot) = self.last_spoken_milestone_id.lock() {
+            if slot.as_deref() == Some(milestone.id.as_str()) {
+                return;
+            }
+        }
+
+        // Commit to firing — update cache BEFORE the await so a rapid
+        // second milestone flip skips via the cooldown.
+        if let Ok(mut slot) = self.last_proactive_at.lock() {
+            *slot = Some(now);
+        }
+        if let Ok(mut slot) = self.last_spoken_milestone_id.lock() {
+            *slot = Some(milestone.id.clone());
+        }
+
+        let prompt = format!(
+            "[MILESTONE PROGRESS] User just completed: \"{}\". \
+             Current step: \"{}\". Speak the next direction in one short sentence.",
+            milestone.goal_text, task_state.current_step.instruction,
+        );
+        println!(
+            "[z-ro:npc] proactive: milestone \"{}\" confirmed → speaking",
+            milestone.id
+        );
+        let _ = self.ask_proactive(prompt, "milestone").await;
     }
 
     /// Helper for the Verifier: reconstitutes a FrameBuffer handle from
@@ -1169,6 +1466,50 @@ mod tests {
         assert!(coord.is_on_air_active());
         coord.set_on_air_active(false);
         assert!(!coord.is_on_air_active());
+    }
+
+    #[test]
+    fn test_proactive_mute_defaults_off_and_toggles() {
+        let coord = make_coordinator("hello");
+        assert!(
+            !coord.is_proactive_muted(),
+            "proactive speech must default unmuted"
+        );
+        coord.set_proactive_muted(true);
+        assert!(coord.is_proactive_muted());
+        coord.set_proactive_muted(false);
+        assert!(!coord.is_proactive_muted());
+    }
+
+    #[tokio::test]
+    async fn test_ask_text_records_manual_ask_timestamp() {
+        // After a manual ask, `last_manual_ask_at` is populated so the
+        // reactive watcher can suppress a proactive speech within the
+        // blackout window.
+        let coord = make_coordinator("ok.");
+        {
+            let guard = coord.last_manual_ask_at.lock().unwrap();
+            assert!(
+                guard.is_none(),
+                "manual-ask timestamp must start unset"
+            );
+        }
+        coord.ask_text("What now?".to_string()).await.unwrap();
+        let guard = coord.last_manual_ask_at.lock().unwrap();
+        assert!(guard.is_some(), "ask_text must stamp last_manual_ask_at");
+    }
+
+    #[tokio::test]
+    async fn test_ask_proactive_refuses_when_not_idle() {
+        // ask_proactive must bail when the coordinator is mid-turn so two
+        // proactive triggers in quick succession can't clobber each other
+        // or a user's manual ask.
+        let coord = make_coordinator("ok");
+        coord.set_state(NpcState::Thinking);
+        let result = coord
+            .ask_proactive("[MILESTONE PROGRESS] test".to_string(), "milestone")
+            .await;
+        assert!(result.is_err(), "proactive must refuse when not idle");
     }
 
     #[tokio::test]
