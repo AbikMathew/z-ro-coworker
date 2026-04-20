@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::AppHandle;
@@ -106,6 +107,13 @@ pub struct NpcCoordinator {
     /// turn currently blocked on an LLM/STT/TTS future; the pipeline then
     /// returns `Err(CANCELLED_ERR)` which we translate back into Idle.
     interrupt: InterruptController,
+    /// Whether the frontend is currently in continuous on-air voice mode
+    /// (Phase 2). Kept here as the source of truth so later phases
+    /// (proactive speech, WrongMove) can condition prompt / audio
+    /// behaviour on it without the frontend round-tripping state every turn.
+    /// Lives outside `NpcState` so `handle_user_event`'s `Idle` gate keeps
+    /// firing the reactive loop between utterances.
+    on_air_active: Arc<AtomicBool>,
 }
 
 /// Payload emitted to the frontend whenever the Verifier decides something
@@ -146,7 +154,24 @@ impl NpcCoordinator {
             app_handle: OnceLock::new(),
             auto_hide: overlay_driver::new_auto_hide_state(),
             interrupt: InterruptController::new(),
+            on_air_active: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Set by the frontend when the user toggles "On-Air" continuous voice
+    /// mode. The backend doesn't drive the mic — it just remembers the
+    /// state so later phases can gate proactive speech on it.
+    pub fn set_on_air_active(&self, active: bool) {
+        self.on_air_active.store(active, Ordering::Relaxed);
+        println!(
+            "[z-ro:npc] on-air mode {}",
+            if active { "ON" } else { "off" }
+        );
+    }
+
+    /// True when the frontend has on-air continuous voice mode enabled.
+    pub fn is_on_air_active(&self) -> bool {
+        self.on_air_active.load(Ordering::Relaxed)
     }
 
     /// Install the Tauri `AppHandle` so the overlay driver can emit events
@@ -1134,6 +1159,16 @@ mod tests {
         assert_eq!(status.model_name, "mock");
         assert_eq!(status.conversation_turns, 0);
         assert!(status.active_task.is_none());
+    }
+
+    #[test]
+    fn test_on_air_flag_defaults_off_and_toggles() {
+        let coord = make_coordinator("hello");
+        assert!(!coord.is_on_air_active(), "on-air must default off");
+        coord.set_on_air_active(true);
+        assert!(coord.is_on_air_active());
+        coord.set_on_air_active(false);
+        assert!(!coord.is_on_air_active());
     }
 
     #[tokio::test]

@@ -60,6 +60,18 @@ pub async fn npc_interrupt(
     coordinator.interrupt().await
 }
 
+/// Toggle continuous on-air voice mode. The frontend owns the mic + VAD;
+/// this command just records whether on-air is live so other backend
+/// logic (Phase 3 proactive speech, Phase 4 WrongMove) can condition on it.
+#[tauri::command]
+pub async fn npc_set_on_air(
+    active: bool,
+    coordinator: State<'_, Arc<NpcCoordinator>>,
+) -> Result<(), String> {
+    coordinator.set_on_air_active(active);
+    Ok(())
+}
+
 /// Process a voice turn: base64-encoded audio bytes in, transcript + TTS audio out.
 ///
 /// `filename` is a hint for the STT provider (e.g. `"audio.webm"`).

@@ -3,6 +3,7 @@
   import type { NpcStatus, ChatMessage } from "$lib/npc/types";
   import { listen } from "@tauri-apps/api/event";
   import EventsBadge from "$lib/components/EventsBadge.svelte";
+  import { startOnAir, type OnAirHandle } from "$lib/audio/vad";
 
   // ── Local UI state ────────────────────────────────────────────────
   let messages: ChatMessage[] = $state([
@@ -22,6 +23,16 @@
   let isRecording = $state(false);
   let micError: string | null = $state(null);
   let currentAudio: HTMLAudioElement | null = null;
+
+  // On-air continuous voice mode. Opt-in; persists to localStorage so it
+  // stays on across reloads. The mic + VAD live entirely on the client —
+  // the backend only knows about the mode via `npc.setOnAir()` so Phase
+  // 3/4 can condition on it.
+  const LS_ON_AIR_KEY = "zro:npc:onAir";
+  let onAirEnabled = $state(false);
+  let onAirHandle: OnAirHandle | null = null;
+  let onAirBusy = $state(false); // prevents double-click race while starting
+  let onAirMicLive = $state(false); // true while VAD is in a speaking state
 
   // Reactive milestone progress: which milestone the Verifier last signalled
   // on, and whether it's confirmed. Keyed by milestone_id so repeated events
@@ -75,9 +86,21 @@
       milestoneProgress = {};
     });
 
+    // Re-enable on-air from the last session if the user left it on.
+    // Deliberately kicked off after activate() so backend state is fresh.
+    try {
+      const saved = localStorage.getItem(LS_ON_AIR_KEY);
+      if (saved === "true") {
+        void enableOnAir();
+      }
+    } catch {
+      /* localStorage may be unavailable — non-fatal */
+    }
+
     return () => {
       stopPlayback();
       stopRecordingSilently();
+      void disableOnAir();
       unlistenInterrupt.then((u) => u()).catch(() => {});
       unlistenProgress.then((u) => u()).catch(() => {});
       unlistenTaskState.then((u) => u()).catch(() => {});
@@ -319,6 +342,120 @@
     stopRecording();
   }
 
+  // ── Voice: on-air continuous mode ────────────────────────────────
+
+  /** Fire one utterance through the existing voice pipeline. Mirrors the
+   *  push-to-talk finalizeRecording() path so chat + audio playback look
+   *  the same whether the mic was held or on-air. */
+  async function shipUtterance(blob: Blob, mimeType: string) {
+    if (isThinking) {
+      // Drop the utterance if we're already mid-turn. Barge-in via the
+      // Stop button is still the expected way to interrupt Zee.
+      return;
+    }
+    isThinking = true;
+    scrollToBottom();
+
+    try {
+      const audioB64 = await blobToBase64(blob);
+      const filename = mimeType.includes("ogg") ? "audio.ogg" : "audio.webm";
+      const result = await npc.askVoice(audioB64, filename);
+
+      if (result.user_transcript.trim()) {
+        messages = [
+          ...messages,
+          { role: "user", content: result.user_transcript },
+        ];
+      }
+      if (result.assistant_text.trim()) {
+        messages = [
+          ...messages,
+          { role: "npc", content: result.assistant_text },
+        ];
+      }
+      scrollToBottom();
+
+      if (result.audio_b64 && result.audio_mime) {
+        playAudio(result.audio_b64, result.audio_mime);
+      }
+    } catch (e) {
+      messages = [
+        ...messages,
+        { role: "npc", content: `Voice turn failed: ${e}` },
+      ];
+    } finally {
+      isThinking = false;
+      scrollToBottom();
+    }
+  }
+
+  async function enableOnAir() {
+    if (onAirEnabled || onAirBusy) return;
+    onAirBusy = true;
+    micError = null;
+    try {
+      onAirHandle = await startOnAir({
+        onUtterance: (blob, mimeType) => {
+          void shipUtterance(blob, mimeType);
+        },
+        // Suppress new utterances while Zee is speaking so the TTS output
+        // doesn't echo back through the mic and trigger a phantom turn.
+        isSuppressed: () => status.state === "Speaking",
+        onStateChange: (s) => {
+          onAirMicLive = s === "speaking";
+        },
+        onError: (err) => {
+          console.warn("[npc] on-air error:", err);
+          micError = `On-air error: ${err.message ?? err}`;
+        },
+      });
+      onAirEnabled = true;
+      void npc.setOnAir(true);
+      try {
+        localStorage.setItem(LS_ON_AIR_KEY, "true");
+      } catch {
+        /* non-fatal */
+      }
+    } catch (e) {
+      micError = `On-air unavailable: ${e}`;
+      console.error("[npc] startOnAir failed:", e);
+      onAirEnabled = false;
+      onAirHandle = null;
+    } finally {
+      onAirBusy = false;
+    }
+  }
+
+  async function disableOnAir() {
+    if (onAirHandle) {
+      const handle = onAirHandle;
+      onAirHandle = null;
+      try {
+        await handle.stop();
+      } catch {
+        /* ignore */
+      }
+    }
+    onAirEnabled = false;
+    onAirMicLive = false;
+    void npc.setOnAir(false);
+    try {
+      localStorage.setItem(LS_ON_AIR_KEY, "false");
+    } catch {
+      /* non-fatal */
+    }
+  }
+
+  function toggleOnAir() {
+    if (onAirEnabled) {
+      void disableOnAir();
+    } else {
+      // Can't run PTT and on-air simultaneously — cancel any in-flight PTT.
+      if (isRecording) stopRecordingSilently();
+      void enableOnAir();
+    }
+  }
+
   /** Barge-in: cancels any in-flight turn (LLM stream, TTS synthesis, audio
    *  playback) and returns the NPC to Idle. Wired to a small "Stop" button
    *  that only appears while Zee is Thinking or Speaking. */
@@ -337,7 +474,11 @@
   );
 </script>
 
-<div class="bg-gray-900 rounded-2xl border border-gray-800 flex flex-col h-96">
+<div
+  class="bg-gray-900 rounded-2xl border flex flex-col h-96"
+  class:on-air-border={onAirEnabled}
+  class:border-gray-800={!onAirEnabled}
+>
   <!-- Header -->
   <div class="p-4 border-b border-gray-800 flex items-center gap-3">
     <div
@@ -352,6 +493,24 @@
       </p>
     </div>
     <EventsBadge />
+    {#if onAirEnabled}
+      <div
+        class="flex items-center gap-1 text-[11px] font-medium"
+        title={onAirMicLive ? "Mic is live — you're speaking" : "Mic is listening"}
+      >
+        <span class="relative flex w-2 h-2">
+          <span
+            class="animate-ping absolute inline-flex w-full h-full rounded-full bg-red-500 opacity-75"
+          ></span>
+          <span
+            class="relative inline-flex w-2 h-2 rounded-full"
+            class:bg-red-500={onAirMicLive}
+            class:bg-red-400={!onAirMicLive}
+          ></span>
+        </span>
+        <span class="text-red-400">ON AIR</span>
+      </div>
+    {/if}
     <!-- Status indicator -->
     <div class="flex items-center gap-1.5">
       <div class="w-2 h-2 rounded-full {stateColor(status.state)}"></div>
@@ -438,22 +597,41 @@
         disabled={isRecording}
         class="flex-1 bg-gray-800 text-white rounded-lg px-3 py-2 text-sm outline-none focus:ring-1 focus:ring-blue-600 placeholder-gray-500 disabled:opacity-50"
       />
-      <!-- Push-to-talk mic: hold to speak, release to send -->
+      <!-- On-air toggle: continuous listening via VAD. Disables PTT. -->
       <button
         type="button"
-        onpointerdown={onMicPointerDown}
-        onpointerup={onMicPointerUp}
-        onpointercancel={onMicPointerUp}
-        onpointerleave={isRecording ? onMicPointerUp : null}
-        disabled={isThinking && !isRecording}
-        aria-label="Hold to talk"
-        title="Hold to talk"
-        class="select-none px-3 py-2 rounded-lg text-sm transition-colors {isRecording
-          ? 'bg-red-600 hover:bg-red-700 animate-pulse'
-          : 'bg-gray-700 hover:bg-gray-600'} disabled:opacity-50 text-white"
+        onclick={toggleOnAir}
+        disabled={onAirBusy}
+        aria-pressed={onAirEnabled}
+        aria-label={onAirEnabled ? "Turn on-air off" : "Turn on-air on"}
+        title={onAirEnabled
+          ? "On-air: continuously listening — click to stop"
+          : "Switch to continuous listening (on-air)"}
+        class="select-none px-3 py-2 rounded-lg text-sm transition-colors disabled:opacity-50 text-white {onAirEnabled
+          ? 'bg-red-600 hover:bg-red-700'
+          : 'bg-gray-700 hover:bg-gray-600'}"
       >
-        {isRecording ? "● Rec" : "🎙"}
+        {onAirEnabled ? "📡 Air" : "📡"}
       </button>
+      <!-- Push-to-talk mic: hold to speak, release to send. Hidden while
+           on-air is active so the two modes don't fight over the mic. -->
+      {#if !onAirEnabled}
+        <button
+          type="button"
+          onpointerdown={onMicPointerDown}
+          onpointerup={onMicPointerUp}
+          onpointercancel={onMicPointerUp}
+          onpointerleave={isRecording ? onMicPointerUp : null}
+          disabled={isThinking && !isRecording}
+          aria-label="Hold to talk"
+          title="Hold to talk"
+          class="select-none px-3 py-2 rounded-lg text-sm transition-colors {isRecording
+            ? 'bg-red-600 hover:bg-red-700 animate-pulse'
+            : 'bg-gray-700 hover:bg-gray-600'} disabled:opacity-50 text-white"
+        >
+          {isRecording ? "● Rec" : "🎙"}
+        </button>
+      {/if}
       {#if isBusy}
         <button
           type="button"
@@ -475,7 +653,11 @@
       {/if}
     </div>
     <p class="text-[11px] text-gray-500 mt-1.5">
-      Hold the mic button to speak · release to send · click Stop to cut Zee off
+      {#if onAirEnabled}
+        📡 On-air: speak naturally — Zee listens continuously. Click 📡 again to turn off.
+      {:else}
+        Hold 🎙 to talk · click 📡 for continuous listening · Stop cuts Zee off
+      {/if}
     </p>
   </div>
 </div>
@@ -512,5 +694,18 @@
     opacity: 0.75;
     font-family: ui-monospace, SFMono-Regular, monospace;
     font-size: 10px;
+  }
+  .on-air-border {
+    border-color: rgb(220, 38, 38);
+    box-shadow: 0 0 0 1px rgba(220, 38, 38, 0.55), 0 0 18px rgba(220, 38, 38, 0.25);
+    animation: on-air-pulse 2s ease-in-out infinite;
+  }
+  @keyframes on-air-pulse {
+    0%, 100% {
+      box-shadow: 0 0 0 1px rgba(220, 38, 38, 0.55), 0 0 12px rgba(220, 38, 38, 0.2);
+    }
+    50% {
+      box-shadow: 0 0 0 1px rgba(220, 38, 38, 0.8), 0 0 22px rgba(220, 38, 38, 0.38);
+    }
   }
 </style>

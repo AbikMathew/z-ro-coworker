@@ -31,11 +31,21 @@ impl ConversationMemory {
         }
     }
 
-    /// Append a turn. If we exceed `max_turns`, the oldest is evicted.
+    /// Append a turn. If we exceed `max_turns`, we evict the oldest
+    /// short-filler turn from the existing history first ("ok", "yeah",
+    /// "got it"); only if no fillers exist do we fall back to dropping
+    /// the oldest. This matters once continuous on-air mode lands in
+    /// Phase 2 — VAD turns fill the buffer in roughly a minute and we
+    /// don't want every substantive turn to get purged along with them.
     pub fn push(&mut self, turn: ConversationTurn) {
         self.turns.push(turn);
         if self.turns.len() > self.max_turns {
-            self.turns.remove(0);
+            let idx = self
+                .turns
+                .iter()
+                .position(is_short_filler)
+                .unwrap_or(0);
+            self.turns.remove(idx);
         }
     }
 
@@ -58,6 +68,43 @@ impl ConversationMemory {
     pub fn is_empty(&self) -> bool {
         self.turns.is_empty()
     }
+}
+
+/// Common single-word / short acknowledgements that carry no context worth
+/// preserving. When the rolling-window history is full, these are evicted
+/// before we start losing substantive turns.
+fn is_short_filler(turn: &ConversationTurn) -> bool {
+    let trimmed = turn.content.trim();
+    if trimmed.is_empty() || trimmed.len() > 24 {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    let clean = lower.trim_end_matches(|c: char| ".!?,".contains(c));
+    matches!(
+        clean,
+        "ok" | "okay"
+            | "yeah"
+            | "yes"
+            | "yep"
+            | "yup"
+            | "no"
+            | "nope"
+            | "sure"
+            | "right"
+            | "got it"
+            | "thanks"
+            | "thank you"
+            | "cool"
+            | "nice"
+            | "good"
+            | "fine"
+            | "alright"
+            | "uh huh"
+            | "mhm"
+            | "k"
+            | "done"
+            | "next"
+    )
 }
 
 #[cfg(test)]
@@ -143,6 +190,69 @@ mod tests {
         mem.push(make_turn("assistant", "second"));
         assert_eq!(mem.len(), 1);
         assert_eq!(mem.recent(10)[0].content, "second");
+    }
+
+    #[test]
+    fn test_filler_evicted_before_substantive_turns() {
+        // When the buffer is full, a short acknowledgement from earlier in
+        // the conversation is dropped instead of the oldest substantive turn.
+        let mut mem = ConversationMemory::new(3);
+        mem.push(make_turn("user", "How do I save this file?"));
+        mem.push(make_turn("assistant", "Ok")); // filler
+        mem.push(make_turn("user", "What about undo?"));
+        // Pushing a 4th exceeds max_turns — the filler "Ok" should go, not
+        // the oldest substantive question.
+        mem.push(make_turn("assistant", "Press Cmd+Z to undo."));
+
+        let remaining: Vec<&str> = mem.recent(10).iter().map(|t| t.content.as_str()).collect();
+        assert_eq!(remaining.len(), 3);
+        assert!(remaining.contains(&"How do I save this file?"));
+        assert!(remaining.contains(&"What about undo?"));
+        assert!(remaining.contains(&"Press Cmd+Z to undo."));
+        assert!(!remaining.iter().any(|c| *c == "Ok"));
+    }
+
+    #[test]
+    fn test_multiple_fillers_oldest_filler_goes_first() {
+        // Two fillers in history; the older one gets evicted on the first
+        // overflow, preserving the newer filler (it may still be useful
+        // context for what just happened).
+        let mut mem = ConversationMemory::new(4);
+        mem.push(make_turn("user", "yeah")); // older filler
+        mem.push(make_turn("user", "Help me rename this"));
+        mem.push(make_turn("assistant", "Tell me the new name."));
+        mem.push(make_turn("user", "got it")); // newer filler — buffer full
+        // Pushing one more overflows — "yeah" should go first (oldest filler).
+        mem.push(make_turn("assistant", "Great. Let me know when done."));
+
+        let remaining: Vec<&str> = mem.recent(10).iter().map(|t| t.content.as_str()).collect();
+        assert_eq!(remaining.len(), 4);
+        assert!(!remaining.contains(&"yeah"));
+        assert!(remaining.contains(&"got it"));
+        assert!(remaining.contains(&"Help me rename this"));
+    }
+
+    #[test]
+    fn test_no_fillers_falls_back_to_fifo() {
+        // If nothing matches the filler list, the oldest substantive turn
+        // is evicted as before (preserves existing test_push_and_eviction).
+        let mut mem = ConversationMemory::new(2);
+        mem.push(make_turn("user", "First substantive question."));
+        mem.push(make_turn("assistant", "A thoughtful answer."));
+        mem.push(make_turn("user", "Second question."));
+        let remaining: Vec<&str> = mem.recent(10).iter().map(|t| t.content.as_str()).collect();
+        assert_eq!(remaining.len(), 2);
+        assert!(!remaining.contains(&"First substantive question."));
+    }
+
+    #[test]
+    fn test_filler_detection_is_punctuation_tolerant() {
+        let mut mem = ConversationMemory::new(2);
+        mem.push(make_turn("user", "Ok."));
+        mem.push(make_turn("user", "An important question."));
+        mem.push(make_turn("assistant", "An important answer."));
+        let remaining: Vec<&str> = mem.recent(10).iter().map(|t| t.content.as_str()).collect();
+        assert!(!remaining.contains(&"Ok."));
     }
 
     #[test]

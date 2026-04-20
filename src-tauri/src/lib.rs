@@ -240,6 +240,7 @@ pub fn run() {
             commands::npc::npc_interrupt,
             commands::npc::npc_list_models,
             commands::npc::npc_set_model,
+            commands::npc::npc_set_on_air,
             commands::capture::capture_request_picker,
             commands::capture::capture_stop,
             commands::capture::capture_status,

@@ -68,6 +68,20 @@ class NpcStore {
     await this.refresh();
   }
 
+  /**
+   * Tell the backend whether continuous on-air voice mode is active. The
+   * frontend owns the mic + VAD; the backend just remembers the state so
+   * later phases (proactive speech, WrongMove) can condition on it.
+   * Fire-and-forget — a failed IPC call shouldn't block the UI toggle.
+   */
+  async setOnAir(active: boolean): Promise<void> {
+    try {
+      await invoke("npc_set_on_air", { active });
+    } catch (e) {
+      console.warn("[npc] setOnAir failed:", e);
+    }
+  }
+
   async askText(question: string): Promise<string> {
     this.status.state = "Thinking";
     try {
