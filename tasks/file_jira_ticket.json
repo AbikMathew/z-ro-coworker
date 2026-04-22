@@ -1,0 +1,70 @@
+{
+  "id": "file_jira_ticket",
+  "title": "File a Jira Ticket",
+  "description": "Log your first bug report the way real engineering teams do it.",
+  "xp_reward": 25,
+  "icon": "🎫",
+  "category": "jira",
+  "difficulty": "beginner",
+  "est_minutes": 6,
+  "steps": [
+    {
+      "id": "open_jira",
+      "instruction": "Open Jira in your browser (atlassian.net or your company's Jira URL)",
+      "hints": [
+        "Your team's Jira URL usually looks like {company}.atlassian.net",
+        "If you're not logged in, sign in with your work account"
+      ],
+      "validation": {
+        "type": "app_context",
+        "match": {
+          "window_title_contains": "Jira",
+          "process_name": null
+        },
+        "fallback_ai": true
+      },
+      "overlay": null,
+      "xp": 5
+    },
+    {
+      "id": "click_create",
+      "instruction": "Click the 'Create' button at the top to start a new issue",
+      "hints": [
+        "It's usually a prominent blue button near the top nav",
+        "Shortcut: press C anywhere in Jira"
+      ],
+      "validation": null,
+      "overlay": {
+        "type": "tooltip",
+        "text": "Look for the 'Create' button in the top bar",
+        "position": "top"
+      },
+      "xp": 5
+    },
+    {
+      "id": "fill_bug_details",
+      "instruction": "Set Issue Type to 'Bug', add a clear summary, and a short description of what went wrong",
+      "hints": [
+        "Summary should read like a one-line headline — what broke?",
+        "In the description, include: what you expected, what happened, how to reproduce"
+      ],
+      "validation": null,
+      "overlay": {
+        "type": "tooltip",
+        "text": "Issue Type → Bug. Then write a clear one-line Summary.",
+        "position": "center"
+      },
+      "xp": 10
+    },
+    {
+      "id": "submit_ticket",
+      "instruction": "Click 'Create' (or press Enter) to submit the ticket",
+      "hints": [
+        "You should see a confirmation toast with the ticket ID like PROJ-123"
+      ],
+      "validation": null,
+      "overlay": null,
+      "xp": 5
+    }
+  ]
+}

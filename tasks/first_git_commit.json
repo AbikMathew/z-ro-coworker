@@ -1,0 +1,69 @@
+{
+  "id": "first_git_commit",
+  "title": "Make Your First Commit",
+  "description": "Stage and save a change with git — the foundation of working on any team codebase.",
+  "xp_reward": 30,
+  "icon": "💾",
+  "category": "git",
+  "difficulty": "beginner",
+  "est_minutes": 7,
+  "steps": [
+    {
+      "id": "check_status",
+      "instruction": "In your repo, run `git status` to see what's changed",
+      "hints": [
+        "You'll see modified files in red and any untracked files at the bottom"
+      ],
+      "validation": null,
+      "overlay": null,
+      "xp": 5
+    },
+    {
+      "id": "make_edit",
+      "instruction": "Open any file in the repo and make a small edit — even a blank line is fine",
+      "hints": [
+        "Save the file once you've edited it",
+        "Re-run `git status` to confirm git sees the change"
+      ],
+      "validation": null,
+      "overlay": null,
+      "xp": 5
+    },
+    {
+      "id": "stage_change",
+      "instruction": "Stage your change with `git add <filename>` (or `git add .` for everything)",
+      "hints": [
+        "`git add .` stages every change in the current directory",
+        "`git status` will now show the file in green"
+      ],
+      "validation": null,
+      "overlay": {
+        "type": "tooltip",
+        "text": "Type: git add .",
+        "position": "center"
+      },
+      "xp": 10
+    },
+    {
+      "id": "write_commit",
+      "instruction": "Run `git commit -m \"your message\"` — write a short description of the change",
+      "hints": [
+        "Good messages use imperative mood: 'Add login button', not 'Added login button'",
+        "Under 72 characters is a good target"
+      ],
+      "validation": null,
+      "overlay": null,
+      "xp": 5
+    },
+    {
+      "id": "verify_log",
+      "instruction": "Run `git log -1` to confirm your commit is recorded",
+      "hints": [
+        "You should see your commit at the top with your name and message"
+      ],
+      "validation": null,
+      "overlay": null,
+      "xp": 5
+    }
+  ]
+}

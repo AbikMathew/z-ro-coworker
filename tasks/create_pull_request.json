@@ -1,0 +1,68 @@
+{
+  "id": "create_pull_request",
+  "title": "Create a Pull Request",
+  "description": "Share your work for review — the way code gets into production on every real team.",
+  "xp_reward": 40,
+  "icon": "🔀",
+  "category": "git",
+  "difficulty": "intermediate",
+  "est_minutes": 10,
+  "steps": [
+    {
+      "id": "create_branch",
+      "instruction": "Create a new branch: `git checkout -b my-first-pr`",
+      "hints": [
+        "Branch names usually describe the change, e.g. `fix-login-bug` or `add-dark-mode`",
+        "Don't commit directly to main — always work on a branch"
+      ],
+      "validation": null,
+      "overlay": null,
+      "xp": 10
+    },
+    {
+      "id": "commit_changes",
+      "instruction": "Make a small change, then stage and commit it",
+      "hints": [
+        "git add . && git commit -m 'your message'",
+        "Keep the change small — it's easier to review"
+      ],
+      "validation": null,
+      "overlay": null,
+      "xp": 10
+    },
+    {
+      "id": "push_branch",
+      "instruction": "Push your branch to GitHub: `git push -u origin my-first-pr`",
+      "hints": [
+        "The -u flag sets the upstream so future `git push`es don't need the branch name",
+        "The output will include a link to open a PR — keep it handy"
+      ],
+      "validation": null,
+      "overlay": {
+        "type": "tooltip",
+        "text": "git push -u origin <your-branch>",
+        "position": "center"
+      },
+      "xp": 10
+    },
+    {
+      "id": "open_pr",
+      "instruction": "Open the PR on GitHub and fill in a clear title and description",
+      "hints": [
+        "Follow the link git printed, or go to your repo on GitHub and click 'Compare & pull request'",
+        "Describe: what it does, why, how to test. Add screenshots if UI changed.",
+        "Request a reviewer if your team expects one"
+      ],
+      "validation": {
+        "type": "app_context",
+        "match": {
+          "window_title_contains": "Pull Request",
+          "process_name": null
+        },
+        "fallback_ai": true
+      },
+      "overlay": null,
+      "xp": 10
+    }
+  ]
+}

@@ -25,5 +25,8 @@ vite.config.ts.timestamp-*
 .idea/
 *.swp
 
+# Claude Code tooling (local dev configs, not app code)
+.claude/
+
 # Logs
 *.log

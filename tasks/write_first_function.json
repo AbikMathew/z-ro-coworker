@@ -1,0 +1,68 @@
+{
+  "id": "write_first_function",
+  "title": "Write Your First Function",
+  "description": "Define a function, call it, and see the output — the atomic unit of writing code.",
+  "xp_reward": 25,
+  "icon": "⚡",
+  "category": "coding",
+  "difficulty": "beginner",
+  "est_minutes": 6,
+  "steps": [
+    {
+      "id": "open_editor",
+      "instruction": "Open VS Code (or your editor of choice)",
+      "hints": [
+        "On Mac: Cmd+Space → 'Visual Studio Code'",
+        "Create a new file with Cmd+N"
+      ],
+      "validation": {
+        "type": "app_context",
+        "match": {
+          "window_title_contains": null,
+          "process_name": "Code"
+        },
+        "fallback_ai": true
+      },
+      "overlay": null,
+      "xp": 5
+    },
+    {
+      "id": "write_function",
+      "instruction": "Write a function `greet(name)` that returns a greeting string",
+      "hints": [
+        "JavaScript: function greet(name) { return `Hello, ${name}!`; }",
+        "Python: def greet(name): return f'Hello, {name}!'",
+        "Save the file with a real extension — .js or .py"
+      ],
+      "validation": null,
+      "overlay": {
+        "type": "tooltip",
+        "text": "Define a function with a parameter and a return value",
+        "position": "center"
+      },
+      "xp": 10
+    },
+    {
+      "id": "call_function",
+      "instruction": "Call your function with a name and print the result",
+      "hints": [
+        "JavaScript: console.log(greet('World'))",
+        "Python: print(greet('World'))"
+      ],
+      "validation": null,
+      "overlay": null,
+      "xp": 5
+    },
+    {
+      "id": "run_file",
+      "instruction": "Run the file and confirm you see 'Hello, World!' in the terminal",
+      "hints": [
+        "JavaScript: `node your-file.js` in a terminal",
+        "Python: `python3 your-file.py`"
+      ],
+      "validation": null,
+      "overlay": null,
+      "xp": 5
+    }
+  ]
+}

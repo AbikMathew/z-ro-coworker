@@ -1,0 +1,29 @@
+# `screencapturekit`'s Swift FFI means our main binary has
+# `@rpath/libswift_Concurrency.dylib` as a load command. Without an rpath
+# dyld can't resolve it — it only searches `/usr/lib/` directly, not
+# `/usr/lib/swift/` where the cached libswift_Concurrency lives — and
+# the app fails to launch with:
+#
+#   dyld: Library not loaded: @rpath/libswift_Concurrency.dylib
+#   tried: '/usr/lib/libswift_Concurrency.dylib' (not in dyld cache)
+#
+# An earlier attempt used `/Library/Developer/CommandLineTools/…` as the
+# rpath. It fixed the load, but some other dep in the tree explicitly
+# links `/usr/lib/swift/libswift_Concurrency.dylib` (hardcoded
+# LC_LOAD_DYLIB via a system framework). That produced TWO copies of
+# the Swift runtime in-process, both registering the same Obj-C
+# classes, and the app crashed.
+#
+# Setting the rpath to `/usr/lib/swift` means OUR resolution and the
+# system framework's resolution end up at the SAME path — dyld dedupes
+# to one mapping, no duplicate class registration.
+
+[target.aarch64-apple-darwin]
+rustflags = [
+  "-C", "link-arg=-Wl,-rpath,/usr/lib/swift",
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
+  "-C", "link-arg=-Wl,-rpath,/usr/lib/swift",
+]

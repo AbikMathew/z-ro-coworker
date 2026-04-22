@@ -1,0 +1,64 @@
+{
+  "id": "clone_github_repo",
+  "title": "Clone a GitHub Repo",
+  "description": "Pull a project from GitHub down to your machine so you can start coding.",
+  "xp_reward": 20,
+  "icon": "📦",
+  "category": "git",
+  "difficulty": "beginner",
+  "est_minutes": 5,
+  "steps": [
+    {
+      "id": "find_repo_url",
+      "instruction": "Open a GitHub repo in your browser and copy the HTTPS clone URL",
+      "hints": [
+        "Click the green 'Code' button and copy the URL under 'HTTPS'",
+        "It ends in .git, like https://github.com/user/repo.git"
+      ],
+      "validation": {
+        "type": "app_context",
+        "match": {
+          "window_title_contains": "GitHub",
+          "process_name": null
+        },
+        "fallback_ai": true
+      },
+      "overlay": null,
+      "xp": 5
+    },
+    {
+      "id": "open_terminal",
+      "instruction": "Open a terminal (Terminal on macOS, iTerm2, or your shell of choice)",
+      "hints": [
+        "On macOS: Cmd+Space → 'Terminal'",
+        "On Windows: Win+S → 'Terminal' or use Git Bash"
+      ],
+      "validation": {
+        "type": "app_context",
+        "match": {
+          "window_title_contains": null,
+          "process_name": "Terminal"
+        },
+        "fallback_ai": true
+      },
+      "overlay": null,
+      "xp": 5
+    },
+    {
+      "id": "run_git_clone",
+      "instruction": "cd to where you want the repo, then run `git clone <URL>`",
+      "hints": [
+        "`cd ~/Development` is a reasonable place",
+        "Paste the URL you copied — git will create a folder for you",
+        "If it asks for credentials, enter your GitHub username + a personal access token"
+      ],
+      "validation": null,
+      "overlay": {
+        "type": "tooltip",
+        "text": "Type: git clone <paste-url>",
+        "position": "center"
+      },
+      "xp": 10
+    }
+  ]
+}

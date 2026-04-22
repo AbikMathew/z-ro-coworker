@@ -22,10 +22,30 @@ tauri = { version = "2", features = ["macos-private-api"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "stream", "multipart"] }
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+async-trait = "0.1"
 dotenvy = "0.15"
 base64 = "0.22"
-xcap = "0.0.9"
-image = { version = "0.25.10", default-features = false, features = ["png"] }
+bytes = "1"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+
+# NPC: macOS accessibility tree + native screen capture + global event tap.
+#
+# `screencapturekit`'s `macos_14_0` feature unlocks SCContentSharingPicker
+# — the native "which window?" dialog that Zoom/Meet use. Apple gates the
+# picker at macOS 14 Sonoma and has penalised alternative paths since
+# Sequoia, so this is the only supported way.
+#
+# `core-graphics` is used directly for CGEventTap (mouse/key event bus in
+# `npc/events.rs`). Required Accessibility permission (System Settings →
+# Privacy & Security → Accessibility); `events::is_accessibility_trusted()`
+# probes for it so the frontend can show a permission nudge.
+[target.'cfg(target_os = "macos")'.dependencies]
+accessibility = "0.1"
+accessibility-sys = "0.1"
+core-foundation = "0.9"
+core-graphics = "0.23"
+screencapturekit = { version = "1.5.4", features = ["macos_14_0", "async"] }
 

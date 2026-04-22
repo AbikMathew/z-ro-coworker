@@ -4,7 +4,22 @@ export interface Task {
   description: string;
   xp_reward: number;
   steps: Step[];
+  // Optional presentation fields (WS-C dashboard)
+  icon?: string | null;
+  category?: TaskCategory | null;
+  difficulty?: TaskDifficulty | null;
+  est_minutes?: number | null;
+  accent_color?: string | null;
 }
+
+export type TaskCategory =
+  | "coding"
+  | "git"
+  | "jira"
+  | "communication"
+  | "productivity";
+
+export type TaskDifficulty = "beginner" | "intermediate" | "advanced";
 
 export interface Step {
   id: string;
